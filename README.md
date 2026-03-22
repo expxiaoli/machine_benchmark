@@ -1,6 +1,6 @@
-# EC2 Manager (Streamlit)
+# EC2 Benchmark
 
-Manage AWS EC2 instances from a local AWS env file with a web UI.
+Do benchmark test for AWS EC2 instances from a local AWS env file with a web UI.
 
 ## Features
 
