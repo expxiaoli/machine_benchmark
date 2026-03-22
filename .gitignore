@@ -1,0 +1,4 @@
+test_results.db
+test_results.db-shm
+test_results.db-wal
+.venv/
