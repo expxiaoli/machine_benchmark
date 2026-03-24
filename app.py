@@ -109,6 +109,11 @@ FIO_RANDWRITE_COMMAND = (
     "--group_reporting"
 )
 
+CPU_ITERATIONS_PER_SEC_PATTERNS = (
+    re.compile(r"iterations/sec\s*=\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE),
+    re.compile(r"Iterations/Sec\s*:\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE),
+)
+
 
 st.set_page_config(page_title="EC2 Manager", page_icon=":cloud:", layout="wide")
 st.title("AWS EC2 Benchmark")
@@ -321,6 +326,146 @@ def _is_sqlite_busy_error(error: sqlite3.OperationalError) -> bool:
     return "locked" in message or "busy" in message
 
 
+def _extract_cpu_iterations_per_sec(value: object) -> Optional[float]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for pattern in CPU_ITERATIONS_PER_SEC_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            continue
+        try:
+            return float(match.group(1))
+        except ValueError:
+            continue
+    return None
+
+
+def _create_test_results_table(
+    conn: sqlite3.Connection, *, table_name: str = "test_results"
+) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            instance_id TEXT NOT NULL,
+            instance_type TEXT,
+            vcpu INTEGER,
+            memory_gib REAL,
+            test_time TEXT NOT NULL,
+            status TEXT NOT NULL,
+            cpu_score REAL,
+            cpu_iterations_per_sec REAL,
+            seqwrite_bw_mib_s REAL,
+            seqwrite_iops REAL,
+            seqwrite_disk_util_pct REAL,
+            seqwrite_cpu_usr_pct REAL,
+            seqwrite_cpu_sys_pct REAL,
+            seqwrite_cpu_total_pct REAL,
+            randwrite_bw_mib_s REAL,
+            randwrite_iops REAL,
+            randwrite_avg_latency_ms REAL,
+            randwrite_p95_latency_ms REAL,
+            randwrite_p99_latency_ms REAL,
+            randwrite_disk_util_pct REAL,
+            randwrite_cpu_usr_pct REAL,
+            randwrite_cpu_sys_pct REAL,
+            randwrite_cpu_total_pct REAL,
+            result_summary TEXT NOT NULL,
+            raw_output TEXT,
+            error_message TEXT
+        )
+        """
+    )
+
+
+def _migrate_test_results_remove_summary_columns(
+    conn: sqlite3.Connection, existing_columns: set[str]
+) -> None:
+    migrated_table_name = "test_results_migrated"
+    target_columns = [
+        "id",
+        "instance_id",
+        "instance_type",
+        "vcpu",
+        "memory_gib",
+        "test_time",
+        "status",
+        "cpu_score",
+        "cpu_iterations_per_sec",
+        "seqwrite_bw_mib_s",
+        "seqwrite_iops",
+        "seqwrite_disk_util_pct",
+        "seqwrite_cpu_usr_pct",
+        "seqwrite_cpu_sys_pct",
+        "seqwrite_cpu_total_pct",
+        "randwrite_bw_mib_s",
+        "randwrite_iops",
+        "randwrite_avg_latency_ms",
+        "randwrite_p95_latency_ms",
+        "randwrite_p99_latency_ms",
+        "randwrite_disk_util_pct",
+        "randwrite_cpu_usr_pct",
+        "randwrite_cpu_sys_pct",
+        "randwrite_cpu_total_pct",
+        "result_summary",
+        "raw_output",
+        "error_message",
+    ]
+
+    conn.execute(f"DROP TABLE IF EXISTS {migrated_table_name}")
+    _create_test_results_table(conn, table_name=migrated_table_name)
+
+    target_columns_sql = ", ".join(target_columns)
+    select_items: List[str] = []
+    for column_name in target_columns:
+        if column_name in existing_columns:
+            select_items.append(column_name)
+        else:
+            select_items.append(f"NULL AS {column_name}")
+
+    conn.execute(
+        f"""
+        INSERT INTO {migrated_table_name} ({target_columns_sql})
+        SELECT {", ".join(select_items)}
+        FROM test_results
+        """
+    )
+
+    if "cpu_result" in existing_columns:
+        rows = conn.execute(
+            """
+            SELECT id, cpu_result
+            FROM test_results
+            WHERE cpu_result IS NOT NULL AND TRIM(cpu_result) != ''
+            """
+        ).fetchall()
+        updates: List[tuple[float, int]] = []
+        for row_id, cpu_result in rows:
+            parsed_iterations = _extract_cpu_iterations_per_sec(cpu_result)
+            if parsed_iterations is None:
+                continue
+            try:
+                normalized_id = int(row_id)
+            except (TypeError, ValueError):
+                continue
+            if normalized_id <= 0:
+                continue
+            updates.append((parsed_iterations, normalized_id))
+        if updates:
+            conn.executemany(
+                f"""
+                UPDATE {migrated_table_name}
+                SET cpu_iterations_per_sec = COALESCE(cpu_iterations_per_sec, ?)
+                WHERE id = ?
+                """,
+                updates,
+            )
+
+    conn.execute("DROP TABLE test_results")
+    conn.execute(f"ALTER TABLE {migrated_table_name} RENAME TO test_results")
+
+
 def _init_test_results_db() -> None:
     TEST_RESULTS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     required_columns = {
@@ -331,20 +476,57 @@ def _init_test_results_db() -> None:
         "memory_gib",
         "test_time",
         "status",
-        "cpu_result",
-        "seqwrite_result",
-        "randwrite_result",
         "cpu_score",
         "cpu_iterations_per_sec",
         "seqwrite_bw_mib_s",
         "seqwrite_iops",
+        "seqwrite_disk_util_pct",
+        "seqwrite_cpu_usr_pct",
+        "seqwrite_cpu_sys_pct",
+        "seqwrite_cpu_total_pct",
         "randwrite_bw_mib_s",
         "randwrite_iops",
+        "randwrite_avg_latency_ms",
+        "randwrite_p95_latency_ms",
+        "randwrite_p99_latency_ms",
+        "randwrite_disk_util_pct",
+        "randwrite_cpu_usr_pct",
+        "randwrite_cpu_sys_pct",
+        "randwrite_cpu_total_pct",
         "result_summary",
         "raw_output",
         "error_message",
     }
+    deprecated_columns = {"cpu_result", "seqwrite_result", "randwrite_result"}
     legacy_columns = {"command_id", "test_type", "metric_value", "metric_unit"}
+    column_migration_types = {
+        "instance_id": "TEXT",
+        "instance_type": "TEXT",
+        "vcpu": "INTEGER",
+        "memory_gib": "REAL",
+        "test_time": "TEXT",
+        "status": "TEXT",
+        "cpu_score": "REAL",
+        "cpu_iterations_per_sec": "REAL",
+        "seqwrite_bw_mib_s": "REAL",
+        "seqwrite_iops": "REAL",
+        "seqwrite_disk_util_pct": "REAL",
+        "seqwrite_cpu_usr_pct": "REAL",
+        "seqwrite_cpu_sys_pct": "REAL",
+        "seqwrite_cpu_total_pct": "REAL",
+        "randwrite_bw_mib_s": "REAL",
+        "randwrite_iops": "REAL",
+        "randwrite_avg_latency_ms": "REAL",
+        "randwrite_p95_latency_ms": "REAL",
+        "randwrite_p99_latency_ms": "REAL",
+        "randwrite_disk_util_pct": "REAL",
+        "randwrite_cpu_usr_pct": "REAL",
+        "randwrite_cpu_sys_pct": "REAL",
+        "randwrite_cpu_total_pct": "REAL",
+        "result_summary": "TEXT",
+        "raw_output": "TEXT",
+        "error_message": "TEXT",
+    }
 
     with _connect_test_results_db() as conn:
         conn.execute("PRAGMA journal_mode = WAL")
@@ -357,37 +539,29 @@ def _init_test_results_db() -> None:
                 row[1]
                 for row in conn.execute("PRAGMA table_info(test_results)").fetchall()
             }
-            need_recreate = bool(existing_columns & legacy_columns) or not required_columns.issubset(
-                existing_columns
-            )
-            if need_recreate:
+            if existing_columns & legacy_columns:
                 conn.execute("DROP TABLE test_results")
+                table_exists = None
+            elif existing_columns & deprecated_columns:
+                _migrate_test_results_remove_summary_columns(conn, existing_columns)
+                existing_columns = {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(test_results)").fetchall()
+                }
+            if table_exists:
+                missing_columns = sorted(required_columns - existing_columns)
+                for column_name in missing_columns:
+                    if column_name == "id":
+                        continue
+                    column_type = column_migration_types.get(column_name)
+                    if not column_type:
+                        continue
+                    conn.execute(
+                        f"ALTER TABLE test_results ADD COLUMN {column_name} {column_type}"
+                    )
 
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS test_results (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                instance_id TEXT NOT NULL,
-                instance_type TEXT,
-                vcpu INTEGER,
-                memory_gib REAL,
-                test_time TEXT NOT NULL,
-                status TEXT NOT NULL,
-                cpu_result TEXT,
-                seqwrite_result TEXT,
-                randwrite_result TEXT,
-                cpu_score REAL,
-                cpu_iterations_per_sec REAL,
-                seqwrite_bw_mib_s REAL,
-                seqwrite_iops REAL,
-                randwrite_bw_mib_s REAL,
-                randwrite_iops REAL,
-                result_summary TEXT NOT NULL,
-                raw_output TEXT,
-                error_message TEXT
-            )
-            """
-        )
+        if not table_exists:
+            _create_test_results_table(conn, table_name="test_results")
         conn.commit()
 
 
@@ -408,15 +582,23 @@ def _insert_test_result(record: Dict[str, object]) -> Optional[int]:
         record.get("memory_gib"),
         test_time,
         status,
-        record.get("cpu_result"),
-        record.get("seqwrite_result"),
-        record.get("randwrite_result"),
         record.get("cpu_score"),
         record.get("cpu_iterations_per_sec"),
         record.get("seqwrite_bw_mib_s"),
         record.get("seqwrite_iops"),
+        record.get("seqwrite_disk_util_pct"),
+        record.get("seqwrite_cpu_usr_pct"),
+        record.get("seqwrite_cpu_sys_pct"),
+        record.get("seqwrite_cpu_total_pct"),
         record.get("randwrite_bw_mib_s"),
         record.get("randwrite_iops"),
+        record.get("randwrite_avg_latency_ms"),
+        record.get("randwrite_p95_latency_ms"),
+        record.get("randwrite_p99_latency_ms"),
+        record.get("randwrite_disk_util_pct"),
+        record.get("randwrite_cpu_usr_pct"),
+        record.get("randwrite_cpu_sys_pct"),
+        record.get("randwrite_cpu_total_pct"),
         result_summary,
         record.get("raw_output"),
         record.get("error_message"),
@@ -435,19 +617,27 @@ def _insert_test_result(record: Dict[str, object]) -> Optional[int]:
                         memory_gib,
                         test_time,
                         status,
-                        cpu_result,
-                        seqwrite_result,
-                        randwrite_result,
                         cpu_score,
                         cpu_iterations_per_sec,
                         seqwrite_bw_mib_s,
                         seqwrite_iops,
+                        seqwrite_disk_util_pct,
+                        seqwrite_cpu_usr_pct,
+                        seqwrite_cpu_sys_pct,
+                        seqwrite_cpu_total_pct,
                         randwrite_bw_mib_s,
                         randwrite_iops,
+                        randwrite_avg_latency_ms,
+                        randwrite_p95_latency_ms,
+                        randwrite_p99_latency_ms,
+                        randwrite_disk_util_pct,
+                        randwrite_cpu_usr_pct,
+                        randwrite_cpu_sys_pct,
+                        randwrite_cpu_total_pct,
                         result_summary,
                         raw_output,
                         error_message
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     insert_params,
                 )
@@ -476,15 +666,23 @@ def _load_test_results(limit: int = 200) -> List[Dict[str, object]]:
                 memory_gib,
                 test_time,
                 status,
-                cpu_result,
-                seqwrite_result,
-                randwrite_result,
                 cpu_score,
                 cpu_iterations_per_sec,
                 seqwrite_bw_mib_s,
                 seqwrite_iops,
+                seqwrite_disk_util_pct,
+                seqwrite_cpu_usr_pct,
+                seqwrite_cpu_sys_pct,
+                seqwrite_cpu_total_pct,
                 randwrite_bw_mib_s,
                 randwrite_iops,
+                randwrite_avg_latency_ms,
+                randwrite_p95_latency_ms,
+                randwrite_p99_latency_ms,
+                randwrite_disk_util_pct,
+                randwrite_cpu_usr_pct,
+                randwrite_cpu_sys_pct,
+                randwrite_cpu_total_pct,
                 result_summary,
                 raw_output,
                 error_message
@@ -598,6 +796,17 @@ def _format_test_metric(value: object, unit: str, fallback: str = "") -> str:
             return f"{rounded} {normalized_unit}"
         return rounded
     return fallback
+
+
+def _format_percent_metric(value: object, fallback: str = "") -> str:
+    if value is None or value == "":
+        return fallback
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    normalized = f"{number:.2f}".rstrip("0").rstrip(".")
+    return f"{normalized}%"
 
 
 def _poll_command_with_live_output(
@@ -1649,15 +1858,23 @@ def _run_cpu_io_test_suite(
         "memory_gib": specs.get("MemoryGiB"),
         "test_time": suite_time,
         "status": "error",
-        "cpu_result": "",
-        "seqwrite_result": "",
-        "randwrite_result": "",
         "cpu_score": None,
         "cpu_iterations_per_sec": None,
         "seqwrite_bw_mib_s": None,
         "seqwrite_iops": None,
+        "seqwrite_disk_util_pct": None,
+        "seqwrite_cpu_usr_pct": None,
+        "seqwrite_cpu_sys_pct": None,
+        "seqwrite_cpu_total_pct": None,
         "randwrite_bw_mib_s": None,
         "randwrite_iops": None,
+        "randwrite_avg_latency_ms": None,
+        "randwrite_p95_latency_ms": None,
+        "randwrite_p99_latency_ms": None,
+        "randwrite_disk_util_pct": None,
+        "randwrite_cpu_usr_pct": None,
+        "randwrite_cpu_sys_pct": None,
+        "randwrite_cpu_total_pct": None,
         "result_summary": "",
         "raw_output": "",
         "error_message": None,
@@ -1724,12 +1941,6 @@ def _run_cpu_io_test_suite(
         if label in suite_summary_map:
             suite_summary_map[label]["Status"] = marker
             suite_summary_map[label]["Key Metric"] = summary
-        if label == "CPU":
-            suite_db_record["cpu_result"] = summary
-        elif label == "SeqWrite":
-            suite_db_record["seqwrite_result"] = summary
-        elif label == "RandWrite":
-            suite_db_record["randwrite_result"] = summary
 
     if not fio_bundle_error:
         try:
@@ -2158,13 +2369,31 @@ def _run_cpu_io_test_suite(
         fio_parsed = parse_fio_result(fio_output)
         fio_bw_mib_s = fio_parsed.get("bw_mib_s")
         fio_iops = fio_parsed.get("iops")
+        fio_avg_latency_ms = fio_parsed.get("avg_latency_ms")
+        fio_p95_latency_ms = fio_parsed.get("p95_latency_ms")
+        fio_p99_latency_ms = fio_parsed.get("p99_latency_ms")
+        fio_disk_util_pct = fio_parsed.get("disk_util_pct")
+        fio_cpu_usr_pct = fio_parsed.get("cpu_usr_pct")
+        fio_cpu_sys_pct = fio_parsed.get("cpu_sys_pct")
+        fio_cpu_total_pct = fio_parsed.get("cpu_total_pct")
         fio_exit_code = fio_parsed.get("exit_code")
         if test_type == TEST_TYPE_SEQWRITE:
             suite_db_record["seqwrite_bw_mib_s"] = fio_bw_mib_s
             suite_db_record["seqwrite_iops"] = fio_iops
+            suite_db_record["seqwrite_disk_util_pct"] = fio_disk_util_pct
+            suite_db_record["seqwrite_cpu_usr_pct"] = fio_cpu_usr_pct
+            suite_db_record["seqwrite_cpu_sys_pct"] = fio_cpu_sys_pct
+            suite_db_record["seqwrite_cpu_total_pct"] = fio_cpu_total_pct
         elif test_type == TEST_TYPE_RANDWRITE:
             suite_db_record["randwrite_bw_mib_s"] = fio_bw_mib_s
             suite_db_record["randwrite_iops"] = fio_iops
+            suite_db_record["randwrite_avg_latency_ms"] = fio_avg_latency_ms
+            suite_db_record["randwrite_p95_latency_ms"] = fio_p95_latency_ms
+            suite_db_record["randwrite_p99_latency_ms"] = fio_p99_latency_ms
+            suite_db_record["randwrite_disk_util_pct"] = fio_disk_util_pct
+            suite_db_record["randwrite_cpu_usr_pct"] = fio_cpu_usr_pct
+            suite_db_record["randwrite_cpu_sys_pct"] = fio_cpu_sys_pct
+            suite_db_record["randwrite_cpu_total_pct"] = fio_cpu_total_pct
 
         if fio_poll_error:
             summary = f"{display_name} poll failed: {fio_poll_error}"
@@ -2240,10 +2469,32 @@ def _run_cpu_io_test_suite(
 
         bw_str = _round_to_int_string(fio_bw_mib_s)
         iops_str = _round_to_int_string(fio_iops) if fio_iops is not None else "N/A"
-        summary = (
-            f"bw={bw_str} MiB/s, iops={iops_str}, "
-            f"exit_code={fio_exit_code}"
-        )
+        summary_parts = [
+            f"bw={bw_str} MiB/s",
+            f"iops={iops_str}",
+        ]
+        if test_type == TEST_TYPE_SEQWRITE:
+            disk_util_str = _format_percent_metric(fio_disk_util_pct, fallback="N/A")
+            cpu_total_str = _format_percent_metric(fio_cpu_total_pct, fallback="N/A")
+            cpu_usr_str = _format_percent_metric(fio_cpu_usr_pct, fallback="N/A")
+            cpu_sys_str = _format_percent_metric(fio_cpu_sys_pct, fallback="N/A")
+            summary_parts.append(f"disk_util={disk_util_str}")
+            summary_parts.append(f"cpu={cpu_total_str} (usr={cpu_usr_str}, sys={cpu_sys_str})")
+        elif test_type == TEST_TYPE_RANDWRITE:
+            avg_latency_str = _format_test_metric(fio_avg_latency_ms, "ms", fallback="N/A")
+            p95_latency_str = _format_test_metric(fio_p95_latency_ms, "ms", fallback="N/A")
+            p99_latency_str = _format_test_metric(fio_p99_latency_ms, "ms", fallback="N/A")
+            disk_util_str = _format_percent_metric(fio_disk_util_pct, fallback="N/A")
+            cpu_total_str = _format_percent_metric(fio_cpu_total_pct, fallback="N/A")
+            cpu_usr_str = _format_percent_metric(fio_cpu_usr_pct, fallback="N/A")
+            cpu_sys_str = _format_percent_metric(fio_cpu_sys_pct, fallback="N/A")
+            summary_parts.append(f"avg_lat={avg_latency_str}")
+            summary_parts.append(f"p95={p95_latency_str}")
+            summary_parts.append(f"p99={p99_latency_str}")
+            summary_parts.append(f"disk_util={disk_util_str}")
+            summary_parts.append(f"cpu={cpu_total_str} (usr={cpu_usr_str}, sys={cpu_sys_str})")
+        summary_parts.append(f"exit_code={fio_exit_code}")
+        summary = ", ".join(summary_parts)
         _record_summary(display_name, summary, success=True)
         _insert_suite_step_result(
             {
@@ -2467,21 +2718,53 @@ def _render_test_results_page() -> None:
     st.caption(f"Total: {len(rows)} record(s)")
     table_rows: List[Dict[str, object]] = []
     for item in rows:
-        cpu_result = str(item.get("cpu_result") or "").strip()
-        if not cpu_result:
-            score = item.get("cpu_score")
-            if score is not None:
-                cpu_result = _format_test_metric(score, "coremark", fallback="")
-        seq_result = str(item.get("seqwrite_result") or "").strip()
-        if not seq_result:
-            seq_bw = item.get("seqwrite_bw_mib_s")
-            if seq_bw is not None:
-                seq_result = _format_test_metric(seq_bw, "MiB/s", fallback="")
-        rand_result = str(item.get("randwrite_result") or "").strip()
-        if not rand_result:
-            rand_bw = item.get("randwrite_bw_mib_s")
-            if rand_bw is not None:
-                rand_result = _format_test_metric(rand_bw, "MiB/s", fallback="")
+        cpu_iterations_per_sec = item.get("cpu_iterations_per_sec")
+        if cpu_iterations_per_sec is None:
+            cpu_iterations_per_sec = _extract_cpu_iterations_per_sec(
+                item.get("result_summary")
+            )
+
+        seq_bw = item.get("seqwrite_bw_mib_s")
+        seq_iops = item.get("seqwrite_iops")
+        seq_disk_util = item.get("seqwrite_disk_util_pct")
+        seq_cpu_usr = item.get("seqwrite_cpu_usr_pct")
+        seq_cpu_sys = item.get("seqwrite_cpu_sys_pct")
+        seq_cpu_total = item.get("seqwrite_cpu_total_pct")
+        if seq_cpu_total is None and (seq_cpu_usr is not None or seq_cpu_sys is not None):
+            try:
+                usr_part = float(seq_cpu_usr or 0.0)
+                sys_part = float(seq_cpu_sys or 0.0)
+                seq_cpu_total = usr_part + sys_part
+            except (TypeError, ValueError):
+                seq_cpu_total = None
+
+        rand_bw = item.get("randwrite_bw_mib_s")
+        rand_iops = item.get("randwrite_iops")
+        rand_avg_latency_ms = item.get("randwrite_avg_latency_ms")
+        rand_p95_latency_ms = item.get("randwrite_p95_latency_ms")
+        rand_p99_latency_ms = item.get("randwrite_p99_latency_ms")
+        rand_disk_util = item.get("randwrite_disk_util_pct")
+        rand_cpu_usr = item.get("randwrite_cpu_usr_pct")
+        rand_cpu_sys = item.get("randwrite_cpu_sys_pct")
+        rand_cpu_total = item.get("randwrite_cpu_total_pct")
+        if rand_cpu_total is None and (rand_cpu_usr is not None or rand_cpu_sys is not None):
+            try:
+                usr_part = float(rand_cpu_usr or 0.0)
+                sys_part = float(rand_cpu_sys or 0.0)
+                rand_cpu_total = usr_part + sys_part
+            except (TypeError, ValueError):
+                rand_cpu_total = None
+
+        seq_cpu_usr_str = _format_percent_metric(seq_cpu_usr, fallback="")
+        seq_cpu_sys_str = _format_percent_metric(seq_cpu_sys, fallback="")
+        seq_cpu_breakdown = ""
+        if seq_cpu_usr_str or seq_cpu_sys_str:
+            seq_cpu_breakdown = f"{seq_cpu_usr_str or 'N/A'} / {seq_cpu_sys_str or 'N/A'}"
+        rand_cpu_usr_str = _format_percent_metric(rand_cpu_usr, fallback="")
+        rand_cpu_sys_str = _format_percent_metric(rand_cpu_sys, fallback="")
+        rand_cpu_breakdown = ""
+        if rand_cpu_usr_str or rand_cpu_sys_str:
+            rand_cpu_breakdown = f"{rand_cpu_usr_str or 'N/A'} / {rand_cpu_sys_str or 'N/A'}"
 
         table_rows.append(
             {
@@ -2491,9 +2774,22 @@ def _render_test_results_page() -> None:
                 "Memory (GiB)": _round_to_int_string(item.get("memory_gib")),
                 "Test Time (UTC)": item.get("test_time"),
                 "Status": item.get("status"),
-                "CPU": cpu_result,
-                "SeqWrite": seq_result,
-                "RandWrite": rand_result,
+                "CPU Iterations/sec": _format_test_metric(
+                    cpu_iterations_per_sec, "", fallback=""
+                ),
+                "SeqWrite BW (MiB/s)": _format_test_metric(seq_bw, "MiB/s", fallback=""),
+                "SeqWrite IOPS": _format_test_metric(seq_iops, "", fallback=""),
+                "SeqWrite Disk Util (%)": _format_percent_metric(seq_disk_util, fallback=""),
+                "SeqWrite CPU Usage (%)": _format_percent_metric(seq_cpu_total, fallback=""),
+                "SeqWrite CPU usr/sys (%)": seq_cpu_breakdown,
+                "RandWrite IOPS": _format_test_metric(rand_iops, "", fallback=""),
+                "RandWrite Throughput (MiB/s)": _format_test_metric(rand_bw, "MiB/s", fallback=""),
+                "RandWrite Avg Latency (ms)": _format_test_metric(rand_avg_latency_ms, "ms", fallback=""),
+                "RandWrite p95 Latency (ms)": _format_test_metric(rand_p95_latency_ms, "ms", fallback=""),
+                "RandWrite p99 Latency (ms)": _format_test_metric(rand_p99_latency_ms, "ms", fallback=""),
+                "RandWrite Disk Util (%)": _format_percent_metric(rand_disk_util, fallback=""),
+                "RandWrite CPU Usage (%)": _format_percent_metric(rand_cpu_total, fallback=""),
+                "RandWrite CPU usr/sys (%)": rand_cpu_breakdown,
             }
         )
     st.dataframe(table_rows, use_container_width=True)

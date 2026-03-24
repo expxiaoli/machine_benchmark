@@ -37,7 +37,7 @@ Do benchmark test for AWS EC2 instances from a local AWS env file with a web UI.
 ### macOS / Linux
 
 ```bash
-cd /Users/xiaoli/coding/machine-test
+cd /path/to/machine_benchmark
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -47,7 +47,7 @@ streamlit run app.py
 ### Windows (PowerShell)
 
 ```powershell
-cd C:\path\to\machine-test
+cd C:\path\to\machine_benchmark
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt

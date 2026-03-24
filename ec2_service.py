@@ -25,6 +25,21 @@ COREMARK_ITER_PER_SEC_PATTERN = re.compile(
 COREMARK_EXIT_CODE_PATTERN = re.compile(r"__COREMARK_EXIT_CODE__=(\d+)")
 FIO_BW_PATTERN = re.compile(r"\bbw=([0-9]+(?:\.[0-9]+)?)([KMGTP]?i?B/s)")
 FIO_IOPS_PATTERN = re.compile(r"\bIOPS=([0-9]+(?:\.[0-9]+)?)([kKmM]?)")
+FIO_CPU_PATTERN = re.compile(
+    r"\bcpu\s*:\s*usr=([0-9]+(?:\.[0-9]+)?)%,\s*sys=([0-9]+(?:\.[0-9]+)?)%",
+    re.IGNORECASE,
+)
+FIO_DISK_UTIL_PATTERN = re.compile(r"\butil=([0-9]+(?:\.[0-9]+)?)%")
+FIO_CLAT_AVG_PATTERN = re.compile(
+    r"\bclat\s*\((nsec|usec|msec|sec)\):[^\n]*?\bavg=([0-9]+(?:\.[0-9]+)?)",
+    re.IGNORECASE,
+)
+FIO_CLAT_PERCENTILES_SECTION_PATTERN = re.compile(
+    r"clat\s+percentiles\s*\((nsec|usec|msec|sec)\):(?P<body>(?:\n\s*\|[^\n]*)+)",
+    re.IGNORECASE,
+)
+FIO_P95_PATTERN = re.compile(r"95\.00th=\[\s*([0-9]+(?:\.[0-9]+)?)\]")
+FIO_P99_PATTERN = re.compile(r"99\.00th=\[\s*([0-9]+(?:\.[0-9]+)?)\]")
 FIO_EXIT_CODE_PATTERN = re.compile(r"__FIO_EXIT_CODE__=(\d+)")
 
 
@@ -627,6 +642,19 @@ def _to_mib_per_sec(value: float, unit: str) -> Optional[float]:
     return None
 
 
+def _to_millis(value: float, unit: str) -> Optional[float]:
+    normalized = (unit or "").strip().lower()
+    if normalized == "nsec":
+        return value / (1000.0 * 1000.0)
+    if normalized == "usec":
+        return value / 1000.0
+    if normalized == "msec":
+        return value
+    if normalized == "sec":
+        return value * 1000.0
+    return None
+
+
 def _parse_iops(value: str, suffix: str) -> Optional[float]:
     try:
         base = float(value)
@@ -643,6 +671,10 @@ def _parse_iops(value: str, suffix: str) -> Optional[float]:
 def parse_fio_result(raw_output: str) -> Dict[str, Any]:
     bw_matches = FIO_BW_PATTERN.findall(raw_output or "")
     iops_matches = FIO_IOPS_PATTERN.findall(raw_output or "")
+    cpu_matches = FIO_CPU_PATTERN.findall(raw_output or "")
+    disk_util_matches = FIO_DISK_UTIL_PATTERN.findall(raw_output or "")
+    clat_avg_matches = FIO_CLAT_AVG_PATTERN.findall(raw_output or "")
+    clat_percentile_sections = FIO_CLAT_PERCENTILES_SECTION_PATTERN.findall(raw_output or "")
     exit_code_match = FIO_EXIT_CODE_PATTERN.search(raw_output or "")
 
     bw_mib_s = None
@@ -658,10 +690,72 @@ def parse_fio_result(raw_output: str) -> Dict[str, Any]:
         value_raw, suffix = iops_matches[-1]
         iops = _parse_iops(value_raw, suffix)
 
+    cpu_usr_pct = None
+    cpu_sys_pct = None
+    cpu_total_pct = None
+    if cpu_matches:
+        usr_raw, sys_raw = cpu_matches[-1]
+        try:
+            cpu_usr_pct = float(usr_raw)
+        except ValueError:
+            cpu_usr_pct = None
+        try:
+            cpu_sys_pct = float(sys_raw)
+        except ValueError:
+            cpu_sys_pct = None
+        if cpu_usr_pct is not None and cpu_sys_pct is not None:
+            cpu_total_pct = cpu_usr_pct + cpu_sys_pct
+
+    disk_util_pct = None
+    if disk_util_matches:
+        try:
+            disk_util_pct = float(disk_util_matches[-1])
+        except ValueError:
+            disk_util_pct = None
+
+    avg_latency_ms = None
+    if clat_avg_matches:
+        unit_raw, value_raw = clat_avg_matches[-1]
+        try:
+            avg_latency_ms = _to_millis(float(value_raw), unit_raw)
+        except ValueError:
+            avg_latency_ms = None
+
+    p95_latency_ms = None
+    p99_latency_ms = None
+    if clat_percentile_sections:
+        # Some SSM outputs are truncated at the tail. Walk backward and pick the
+        # latest percentile block that still contains the target percentiles.
+        for unit_raw, section_body in reversed(clat_percentile_sections):
+            body_text = section_body or ""
+            if p95_latency_ms is None:
+                p95_match = FIO_P95_PATTERN.search(body_text)
+                if p95_match:
+                    try:
+                        p95_latency_ms = _to_millis(float(p95_match.group(1)), unit_raw)
+                    except ValueError:
+                        p95_latency_ms = None
+            if p99_latency_ms is None:
+                p99_match = FIO_P99_PATTERN.search(body_text)
+                if p99_match:
+                    try:
+                        p99_latency_ms = _to_millis(float(p99_match.group(1)), unit_raw)
+                    except ValueError:
+                        p99_latency_ms = None
+            if p95_latency_ms is not None and p99_latency_ms is not None:
+                break
+
     exit_code = int(exit_code_match.group(1)) if exit_code_match else None
     return {
         "bw_mib_s": bw_mib_s,
         "iops": iops,
+        "avg_latency_ms": avg_latency_ms,
+        "p95_latency_ms": p95_latency_ms,
+        "p99_latency_ms": p99_latency_ms,
+        "cpu_usr_pct": cpu_usr_pct,
+        "cpu_sys_pct": cpu_sys_pct,
+        "cpu_total_pct": cpu_total_pct,
+        "disk_util_pct": disk_util_pct,
         "exit_code": exit_code,
     }
 
