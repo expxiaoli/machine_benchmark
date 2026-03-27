@@ -1546,6 +1546,10 @@ def _run_coremark_test(
     exit_code = parsed.get("exit_code")
     score = parsed.get("coremark_score")
     iterations_per_sec = parsed.get("iterations_per_sec")
+    cpu_output_invalid = (
+        "Errors detected" in combined_output
+        or "Must execute for at least 10 secs" in combined_output
+    )
 
     if poll_error:
         result_summary = "Failed to poll test command"
@@ -1585,6 +1589,30 @@ def _run_coremark_test(
                 "command_id": command_id,
                 "test_type": TEST_TYPE_CPU,
                 "metric_value": score,
+                "metric_unit": "coremark",
+                "coremark_score": score,
+                "iterations_per_sec": iterations_per_sec,
+                "result_summary": result_summary,
+                "raw_output": combined_output,
+                "error_message": result_summary,
+            }
+        )
+        return
+
+    if cpu_output_invalid:
+        result_summary = "CoreMark output invalid: errors detected or runtime below 10 seconds"
+        st.error(result_summary)
+        _insert_test_result(
+            {
+                "instance_id": instance_id,
+                "instance_type": instance.get("InstanceType"),
+                "vcpu": specs.get("vCPU"),
+                "memory_gib": specs.get("MemoryGiB"),
+                "test_time": test_time,
+                "status": "error",
+                "command_id": command_id,
+                "test_type": TEST_TYPE_CPU,
+                "metric_value": None,
                 "metric_unit": "coremark",
                 "coremark_score": score,
                 "iterations_per_sec": iterations_per_sec,
@@ -2147,6 +2175,10 @@ def _run_cpu_io_test_suite(
             cpu_score = cpu_parsed.get("coremark_score")
             cpu_iterations_per_sec = cpu_parsed.get("iterations_per_sec")
             cpu_exit_code = cpu_parsed.get("exit_code")
+            cpu_output_invalid = (
+                "Errors detected" in cpu_output
+                or "Must execute for at least 10 secs" in cpu_output
+            )
             suite_db_record["cpu_score"] = cpu_score
             suite_db_record["cpu_iterations_per_sec"] = cpu_iterations_per_sec
 
@@ -2186,6 +2218,28 @@ def _run_cpu_io_test_suite(
                         "command_id": cpu_command_id,
                         "test_type": TEST_TYPE_CPU,
                         "metric_value": cpu_score,
+                        "metric_unit": "coremark",
+                        "coremark_score": cpu_score,
+                        "iterations_per_sec": cpu_iterations_per_sec,
+                        "result_summary": summary,
+                        "raw_output": cpu_output,
+                        "error_message": summary,
+                    }
+                )
+            elif cpu_output_invalid:
+                summary = "CoreMark output invalid: errors detected or runtime below 10 seconds"
+                _record_summary("CPU", summary, success=False)
+                _insert_suite_step_result(
+                    {
+                        "instance_id": instance_id,
+                        "instance_type": instance.get("InstanceType"),
+                        "vcpu": specs.get("vCPU"),
+                        "memory_gib": specs.get("MemoryGiB"),
+                        "test_time": cpu_test_time,
+                        "status": "error",
+                        "command_id": cpu_command_id,
+                        "test_type": TEST_TYPE_CPU,
+                        "metric_value": None,
                         "metric_unit": "coremark",
                         "coremark_score": cpu_score,
                         "iterations_per_sec": cpu_iterations_per_sec,
