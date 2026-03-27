@@ -1465,8 +1465,7 @@ def _run_coremark_test(
     remote_dir = "/tmp/coremark_streamlit"
     cpu_threads = max(int(specs.get("vCPU") or 1), 1)
     remote_command = (
-        f"timeout {duration_seconds}s {remote_dir}/coremark M{cpu_threads} 0x0 0x0 0x66 0 "
-        f"> {remote_dir}/coremark.log 2>&1"
+        f"parallel_coremark workers={cpu_threads}, per_worker='timeout {duration_seconds}s {remote_dir}/coremark 0x0 0x0 0x66 0'"
     )
     test_time = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     try:
@@ -2082,8 +2081,7 @@ def _run_cpu_io_test_suite(
         f"[CPU] thread_count={cpu_threads}",
     )
     cpu_command = (
-        f"timeout {cpu_duration_seconds}s {cpu_remote_dir}/coremark M{cpu_threads} 0x0 0x0 0x66 0 "
-        f"> {cpu_remote_dir}/coremark.log 2>&1"
+        f"parallel_coremark workers={cpu_threads}, per_worker='timeout {cpu_duration_seconds}s {cpu_remote_dir}/coremark 0x0 0x0 0x66 0'"
     )
     if coremark_bundle_error or not coremark_bundle:
         error_message = (

@@ -568,21 +568,42 @@ def start_coremark_benchmark(
         [
             f'echo "__COREMARK_THREADS__={max_threads}"',
             'echo "__COREMARK_START__"',
-            'rm -f "$REMOTE_DIR/coremark.log"',
+            'rm -f "$REMOTE_DIR/coremark.log" "$REMOTE_DIR"/coremark-*.log',
             'touch "$REMOTE_DIR/coremark.log"',
             'if [ "$CGROUP_ENABLED" -eq 1 ]; then',
             (
-                f'  (echo $$ > "$CGROUP_PATH/cgroup.procs"; '
-                f'timeout {max_duration}s "$REMOTE_DIR/coremark" M{max_threads} 0x0 0x0 0x66 0 '
-                '> "$REMOTE_DIR/coremark.log" 2>&1) &'
+                f'  (EXIT_CODE=0; PIDS=""; '
+                f'for i in $(seq 1 {max_threads}); do '
+                f'WORKER_LOG="$REMOTE_DIR/coremark-$i.log"; '
+                f'touch "$WORKER_LOG"; '
+                f'(echo $$ > "$CGROUP_PATH/cgroup.procs"; timeout {max_duration}s "$REMOTE_DIR/coremark" 0x0 0x0 0x66 0 > "$WORKER_LOG" 2>&1) & '
+                f'PIDS="$PIDS $!"; '
+                f'done; '
+                f'for pid in $PIDS; do wait "$pid" || EXIT_CODE=$?; done; '
+                f'cat "$REMOTE_DIR"/coremark-*.log > "$REMOTE_DIR/coremark.log" || true; '
+                f'SUM_ITER=$(grep -h "Iterations/Sec" "$REMOTE_DIR"/coremark-*.log | awk -F":" "{{sum += \\$2}} END {{if (NR>0) printf \"%.6f\", sum}}" || true); '
+                f'if [ -n "$SUM_ITER" ]; then echo "Iterations/Sec : $SUM_ITER" >> "$REMOTE_DIR/coremark.log"; echo "CoreMark 1.0 : $SUM_ITER / aggregate" >> "$REMOTE_DIR/coremark.log"; fi; '
+                f'if grep -q "Errors detected\|Must execute for at least 10 secs" "$REMOTE_DIR/coremark.log"; then EXIT_CODE=125; fi; '
+                f'exit "$EXIT_CODE") &'
             ),
             'else',
             (
-                f'  (timeout {max_duration}s "$REMOTE_DIR/coremark" M{max_threads} 0x0 0x0 0x66 0 '
-                '> "$REMOTE_DIR/coremark.log" 2>&1) &'
+                f'  (EXIT_CODE=0; PIDS=""; '
+                f'for i in $(seq 1 {max_threads}); do '
+                f'WORKER_LOG="$REMOTE_DIR/coremark-$i.log"; '
+                f'touch "$WORKER_LOG"; '
+                f'(timeout {max_duration}s "$REMOTE_DIR/coremark" 0x0 0x0 0x66 0 > "$WORKER_LOG" 2>&1) & '
+                f'PIDS="$PIDS $!"; '
+                f'done; '
+                f'for pid in $PIDS; do wait "$pid" || EXIT_CODE=$?; done; '
+                f'cat "$REMOTE_DIR"/coremark-*.log > "$REMOTE_DIR/coremark.log" || true; '
+                f'SUM_ITER=$(grep -h "Iterations/Sec" "$REMOTE_DIR"/coremark-*.log | awk -F":" "{{sum += \\$2}} END {{if (NR>0) printf \"%.6f\", sum}}" || true); '
+                f'if [ -n "$SUM_ITER" ]; then echo "Iterations/Sec : $SUM_ITER" >> "$REMOTE_DIR/coremark.log"; echo "CoreMark 1.0 : $SUM_ITER / aggregate" >> "$REMOTE_DIR/coremark.log"; fi; '
+                f'if grep -q "Errors detected\|Must execute for at least 10 secs" "$REMOTE_DIR/coremark.log"; then EXIT_CODE=125; fi; '
+                f'exit "$EXIT_CODE") &'
             ),
             'fi',
-            "COREMARK_PID=$!",
+            "COREMARK_PID=$!", 
             'tail -n +1 -f "$REMOTE_DIR/coremark.log" &',
             "TAIL_PID=$!",
             (
