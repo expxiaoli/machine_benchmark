@@ -510,10 +510,6 @@ def start_coremark_benchmark(
     safe_remote_dir = remote_dir.strip() or "/tmp/coremark_streamlit"
     safe_remote_dir_q = _shell_quote_single(safe_remote_dir)
     remote_coremark = f"{safe_remote_dir}/coremark"
-    coremark_exec_cmd = (
-        f'timeout {max_duration}s "$REMOTE_DIR/coremark" 0x0 0x0 0x66 0 '
-        '> "$REMOTE_DIR/coremark.log" 2>&1'
-    )
     commands = [
         "set -euo pipefail",
         f"REMOTE_DIR={safe_remote_dir_q}",
@@ -571,11 +567,17 @@ def start_coremark_benchmark(
             'echo "__COREMARK_START__"',
             'rm -f "$REMOTE_DIR/coremark.log"',
             'touch "$REMOTE_DIR/coremark.log"',
-            f"COREMARK_EXEC={_shell_quote_single(coremark_exec_cmd)}",
             'if [ "$CGROUP_ENABLED" -eq 1 ]; then',
-            '  bash -lc "echo \\$$ > \"$CGROUP_PATH/cgroup.procs\"; exec bash -lc \"$COREMARK_EXEC\"" &',
+            (
+                f'  (echo $$ > "$CGROUP_PATH/cgroup.procs"; '
+                f'timeout {max_duration}s "$REMOTE_DIR/coremark" 0x0 0x0 0x66 0 '
+                '> "$REMOTE_DIR/coremark.log" 2>&1) &'
+            ),
             'else',
-            '  bash -lc "$COREMARK_EXEC" &',
+            (
+                f'  (timeout {max_duration}s "$REMOTE_DIR/coremark" 0x0 0x0 0x66 0 '
+                '> "$REMOTE_DIR/coremark.log" 2>&1) &'
+            ),
             'fi',
             "COREMARK_PID=$!",
             'tail -n +1 -f "$REMOTE_DIR/coremark.log" &',
@@ -1064,7 +1066,7 @@ def start_fio_benchmark(
         "EXIT_CODE=0",
         'touch "$REMOTE_LOG"',
         'if [ "$CGROUP_ENABLED" -eq 1 ]; then',
-        '  bash -lc "echo \\$$ > \"$CGROUP_PATH/cgroup.procs\"; exec bash -lc \"$FIO_CMD_RESOLVED\"" > "$REMOTE_LOG" 2>&1 &',
+        '  (echo $$ > "$CGROUP_PATH/cgroup.procs"; eval "$FIO_CMD_RESOLVED" > "$REMOTE_LOG" 2>&1) &',
         'else',
         '  (eval "$FIO_CMD_RESOLVED" > "$REMOTE_LOG" 2>&1) &',
         'fi',
