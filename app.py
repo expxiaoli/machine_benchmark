@@ -1463,8 +1463,9 @@ def _run_coremark_test(
     instance_id = str(instance["InstanceId"])
     duration_seconds = 30
     remote_dir = "/tmp/coremark_streamlit"
+    cpu_threads = max(int(specs.get("vCPU") or 1), 1)
     remote_command = (
-        f"timeout {duration_seconds}s {remote_dir}/coremark 0x0 0x0 0x66 0 "
+        f"timeout {duration_seconds}s {remote_dir}/coremark 0x0 0x0 0x66 {cpu_threads} "
         f"> {remote_dir}/coremark.log 2>&1"
     )
     test_time = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -1501,6 +1502,7 @@ def _run_coremark_test(
                 instance_id=instance_id,
                 linux_binary_path=str(coremark_bundle["coremark_binary"]),
                 duration_seconds=duration_seconds,
+                cpu_threads=cpu_threads,
             )
     except (ClientError, FileNotFoundError, RuntimeError) as error:
         message = f"Failed to start CoreMark test: {error}"
@@ -2039,8 +2041,14 @@ def _run_cpu_io_test_suite(
     cpu_test_time = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     cpu_duration_seconds = 30
     cpu_remote_dir = "/tmp/coremark_streamlit"
+    cpu_threads = max(int(cgroup_cpu_cores or specs.get("vCPU") or 1), 1)
+    _append_live_output_block(
+        live_output_lines,
+        log_placeholder,
+        f"[CPU] thread_count={cpu_threads}",
+    )
     cpu_command = (
-        f"timeout {cpu_duration_seconds}s {cpu_remote_dir}/coremark 0x0 0x0 0x66 0 "
+        f"timeout {cpu_duration_seconds}s {cpu_remote_dir}/coremark 0x0 0x0 0x66 {cpu_threads} "
         f"> {cpu_remote_dir}/coremark.log 2>&1"
     )
     if coremark_bundle_error or not coremark_bundle:
@@ -2077,6 +2085,7 @@ def _run_cpu_io_test_suite(
                     instance_id=instance_id,
                     linux_binary_path=str(coremark_bundle["coremark_binary"]),
                     duration_seconds=cpu_duration_seconds,
+                    cpu_threads=cpu_threads,
                     upload_binary=coremark_upload_needed,
                     cgroup_cpu_cores=cgroup_cpu_cores,
                     cgroup_memory_mib=cgroup_memory_mib,

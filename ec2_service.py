@@ -497,6 +497,7 @@ def start_coremark_benchmark(
     instance_id: str,
     linux_binary_path: str,
     duration_seconds: int = 30,
+    cpu_threads: Optional[int] = None,
     remote_dir: str = "/tmp/coremark_streamlit",
     chunk_size: int = 1800,
     chunks_per_command: int = 12,
@@ -507,6 +508,7 @@ def start_coremark_benchmark(
     cgroup_name_prefix: str = "benchmark-cpu",
 ) -> str:
     max_duration = max(int(duration_seconds), 1)
+    max_threads = max(int(cpu_threads or 0), 1)
     safe_remote_dir = remote_dir.strip() or "/tmp/coremark_streamlit"
     safe_remote_dir_q = _shell_quote_single(safe_remote_dir)
     remote_coremark = f"{safe_remote_dir}/coremark"
@@ -564,18 +566,19 @@ def start_coremark_benchmark(
 
     commands.extend(
         [
+            f'echo "__COREMARK_THREADS__={max_threads}"',
             'echo "__COREMARK_START__"',
             'rm -f "$REMOTE_DIR/coremark.log"',
             'touch "$REMOTE_DIR/coremark.log"',
             'if [ "$CGROUP_ENABLED" -eq 1 ]; then',
             (
                 f'  (echo $$ > "$CGROUP_PATH/cgroup.procs"; '
-                f'timeout {max_duration}s "$REMOTE_DIR/coremark" 0x0 0x0 0x66 0 '
+                f'timeout {max_duration}s "$REMOTE_DIR/coremark" 0x0 0x0 0x66 {max_threads} '
                 '> "$REMOTE_DIR/coremark.log" 2>&1) &'
             ),
             'else',
             (
-                f'  (timeout {max_duration}s "$REMOTE_DIR/coremark" 0x0 0x0 0x66 0 '
+                f'  (timeout {max_duration}s "$REMOTE_DIR/coremark" 0x0 0x0 0x66 {max_threads} '
                 '> "$REMOTE_DIR/coremark.log" 2>&1) &'
             ),
             'fi',
