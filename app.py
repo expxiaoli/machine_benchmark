@@ -78,6 +78,9 @@ TEST_TYPE_CPU = "cpu"
 TEST_TYPE_SEQWRITE = "seqwrite"
 TEST_TYPE_RANDWRITE = "randwrite"
 
+DEFAULT_CGROUP_LIMIT_CPU_CORES = 2
+DEFAULT_CGROUP_LIMIT_MEMORY_GIB = 4.0
+
 FIO_SEQWRITE_COMMAND = (
     "taskset -c 0-15 fio --name=seqwrite "
     "--directory=/mnt/fio "
@@ -371,6 +374,9 @@ def _create_test_results_table(
             randwrite_cpu_usr_pct REAL,
             randwrite_cpu_sys_pct REAL,
             randwrite_cpu_total_pct REAL,
+            cgroup_cpu_cores INTEGER,
+            cgroup_memory_gib REAL,
+            cgroup_profile TEXT,
             result_summary TEXT NOT NULL,
             raw_output TEXT,
             error_message TEXT
@@ -408,6 +414,9 @@ def _migrate_test_results_remove_summary_columns(
         "randwrite_cpu_usr_pct",
         "randwrite_cpu_sys_pct",
         "randwrite_cpu_total_pct",
+        "cgroup_cpu_cores",
+        "cgroup_memory_gib",
+        "cgroup_profile",
         "result_summary",
         "raw_output",
         "error_message",
@@ -493,6 +502,9 @@ def _init_test_results_db() -> None:
         "randwrite_cpu_usr_pct",
         "randwrite_cpu_sys_pct",
         "randwrite_cpu_total_pct",
+        "cgroup_cpu_cores",
+        "cgroup_memory_gib",
+        "cgroup_profile",
         "result_summary",
         "raw_output",
         "error_message",
@@ -523,6 +535,9 @@ def _init_test_results_db() -> None:
         "randwrite_cpu_usr_pct": "REAL",
         "randwrite_cpu_sys_pct": "REAL",
         "randwrite_cpu_total_pct": "REAL",
+        "cgroup_cpu_cores": "INTEGER",
+        "cgroup_memory_gib": "REAL",
+        "cgroup_profile": "TEXT",
         "result_summary": "TEXT",
         "raw_output": "TEXT",
         "error_message": "TEXT",
@@ -599,6 +614,9 @@ def _insert_test_result(record: Dict[str, object]) -> Optional[int]:
         record.get("randwrite_cpu_usr_pct"),
         record.get("randwrite_cpu_sys_pct"),
         record.get("randwrite_cpu_total_pct"),
+        record.get("cgroup_cpu_cores"),
+        record.get("cgroup_memory_gib"),
+        record.get("cgroup_profile"),
         result_summary,
         record.get("raw_output"),
         record.get("error_message"),
@@ -634,10 +652,13 @@ def _insert_test_result(record: Dict[str, object]) -> Optional[int]:
                         randwrite_cpu_usr_pct,
                         randwrite_cpu_sys_pct,
                         randwrite_cpu_total_pct,
+                        cgroup_cpu_cores,
+                        cgroup_memory_gib,
+                        cgroup_profile,
                         result_summary,
                         raw_output,
                         error_message
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     insert_params,
                 )
@@ -683,6 +704,9 @@ def _load_test_results(limit: int = 200) -> List[Dict[str, object]]:
                 randwrite_cpu_usr_pct,
                 randwrite_cpu_sys_pct,
                 randwrite_cpu_total_pct,
+                cgroup_cpu_cores,
+                cgroup_memory_gib,
+                cgroup_profile,
                 result_summary,
                 raw_output,
                 error_message
@@ -1820,7 +1844,12 @@ def _append_live_output_block(
 
 
 def _run_cpu_io_test_suite(
-    clients: Dict[str, object], instance: Dict[str, object], specs: Dict[str, object]
+    clients: Dict[str, object],
+    instance: Dict[str, object],
+    specs: Dict[str, object],
+    *,
+    cgroup_cpu_cores: Optional[int] = None,
+    cgroup_memory_gib: Optional[float] = None,
 ) -> None:
     instance_id = str(instance["InstanceId"])
     suite_time = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -1828,9 +1857,16 @@ def _run_cpu_io_test_suite(
     st.markdown("**CPU/IO Test Live output**")
     status_placeholder = st.empty()
     log_placeholder = st.empty()
+    cgroup_profile = "unlimited"
+    cgroup_memory_mib: Optional[int] = None
+    if cgroup_cpu_cores is not None and cgroup_memory_gib is not None:
+        cgroup_memory_mib = int(float(cgroup_memory_gib) * 1024)
+        cgroup_profile = f"cgroup-v2 cpu={int(cgroup_cpu_cores)} mem={float(cgroup_memory_gib):g}GiB"
+
     live_output_lines: List[str] = [
         f"# CPU/IO Test Suite started at {suite_time}",
         f"# instance_id={instance_id}",
+        f"# resource_profile={cgroup_profile}",
     ]
     log_placeholder.code("\n".join(live_output_lines), language="bash")
 
@@ -1875,6 +1911,9 @@ def _run_cpu_io_test_suite(
         "randwrite_cpu_usr_pct": None,
         "randwrite_cpu_sys_pct": None,
         "randwrite_cpu_total_pct": None,
+        "cgroup_cpu_cores": cgroup_cpu_cores,
+        "cgroup_memory_gib": cgroup_memory_gib,
+        "cgroup_profile": cgroup_profile,
         "result_summary": "",
         "raw_output": "",
         "error_message": None,
@@ -2039,6 +2078,9 @@ def _run_cpu_io_test_suite(
                     linux_binary_path=str(coremark_bundle["coremark_binary"]),
                     duration_seconds=cpu_duration_seconds,
                     upload_binary=coremark_upload_needed,
+                    cgroup_cpu_cores=cgroup_cpu_cores,
+                    cgroup_memory_mib=cgroup_memory_mib,
+                    cgroup_name_prefix="benchmark-cpu",
                 )
         except (ClientError, FileNotFoundError, RuntimeError) as error:
             message = f"Failed to start CPU test: {error}"
@@ -2318,6 +2360,9 @@ def _run_cpu_io_test_suite(
                     upload_bundle=not fio_bundle_uploaded,
                     upload_timeout_seconds=1200,
                     timeout_seconds=900,
+                    cgroup_cpu_cores=cgroup_cpu_cores,
+                    cgroup_memory_mib=cgroup_memory_mib,
+                    cgroup_name_prefix=f"benchmark-{test_type}",
                 )
                 fio_bundle_uploaded = True
         except (ClientError, RuntimeError) as error:
@@ -2606,8 +2651,40 @@ def _render_detail_page(clients: Dict[str, object], region: str, instance_id: st
     )
     st.write(f"Local CoreMark bundle root: `{COREMARK_LINUX_BUNDLE_DIR}`")
     st.write(f"Local fio bundle root: `{FIO_LINUX_BUNDLE_DIR}`")
+
+    st.markdown("#### cgroup v2 Resource Limits")
+    cgroup_cols = st.columns(2)
+    limit_cpu_cores = cgroup_cols[0].number_input(
+        "Limit CPU cores",
+        min_value=1,
+        max_value=max(int(specs.get("vCPU") or 1), 1),
+        value=min(DEFAULT_CGROUP_LIMIT_CPU_CORES, max(int(specs.get("vCPU") or 1), 1)),
+        step=1,
+        help="Hard CPU quota by cgroup v2 cpu.max. All benchmark child processes are included.",
+    )
+    max_memory_gib = max(float(specs.get("MemoryGiB") or 1.0), 1.0)
+    default_memory_gib = min(DEFAULT_CGROUP_LIMIT_MEMORY_GIB, max_memory_gib)
+    limit_memory_gib = cgroup_cols[1].number_input(
+        "Limit memory (GiB)",
+        min_value=0.5,
+        max_value=max_memory_gib,
+        value=float(default_memory_gib),
+        step=0.5,
+        help="Hard memory limit by cgroup v2 memory.max. OOM in benchmark process is treated as failure.",
+    )
+
+    st.caption(
+        f"Current profile: cgroup-v2 cpu={int(limit_cpu_cores)} mem={float(limit_memory_gib):g}GiB"
+    )
+
     if st.button("CPU/IO Test", type="primary"):
-        _run_cpu_io_test_suite(clients, instance, specs)
+        _run_cpu_io_test_suite(
+            clients,
+            instance,
+            specs,
+            cgroup_cpu_cores=int(limit_cpu_cores),
+            cgroup_memory_gib=float(limit_memory_gib),
+        )
 
     st.markdown("### Instance Details")
     st.json(instance)
@@ -2774,6 +2851,9 @@ def _render_test_results_page() -> None:
                 "Memory (GiB)": _round_to_int_string(item.get("memory_gib")),
                 "Test Time (UTC)": item.get("test_time"),
                 "Status": item.get("status"),
+                "Resource Profile": item.get("cgroup_profile") or "unlimited",
+                "Limit CPU": _round_to_int_string(item.get("cgroup_cpu_cores")),
+                "Limit Memory (GiB)": _format_test_metric(item.get("cgroup_memory_gib"), "GiB", fallback=""),
                 "CPU Iterations/sec": _format_test_metric(
                     cpu_iterations_per_sec, "", fallback=""
                 ),

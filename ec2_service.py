@@ -502,16 +502,30 @@ def start_coremark_benchmark(
     chunks_per_command: int = 12,
     upload_timeout_seconds: int = 600,
     upload_binary: bool = True,
+    cgroup_cpu_cores: Optional[int] = None,
+    cgroup_memory_mib: Optional[int] = None,
+    cgroup_name_prefix: str = "benchmark-cpu",
 ) -> str:
     max_duration = max(int(duration_seconds), 1)
     safe_remote_dir = remote_dir.strip() or "/tmp/coremark_streamlit"
     safe_remote_dir_q = _shell_quote_single(safe_remote_dir)
     remote_coremark = f"{safe_remote_dir}/coremark"
+    coremark_exec_cmd = (
+        f'timeout {max_duration}s "$REMOTE_DIR/coremark" 0x0 0x0 0x66 0 '
+        '> "$REMOTE_DIR/coremark.log" 2>&1'
+    )
     commands = [
         "set -euo pipefail",
         f"REMOTE_DIR={safe_remote_dir_q}",
         'mkdir -p "$REMOTE_DIR"',
     ]
+    commands.extend(
+        _build_cgroup_v2_setup_commands(
+            cgroup_name_prefix=cgroup_name_prefix,
+            cgroup_cpu_cores=cgroup_cpu_cores,
+            cgroup_memory_mib=cgroup_memory_mib,
+        )
+    )
     if upload_binary:
         binary_file = Path(linux_binary_path)
         if not binary_file.exists():
@@ -557,10 +571,12 @@ def start_coremark_benchmark(
             'echo "__COREMARK_START__"',
             'rm -f "$REMOTE_DIR/coremark.log"',
             'touch "$REMOTE_DIR/coremark.log"',
-            (
-                f'timeout {max_duration}s "$REMOTE_DIR/coremark" 0x0 0x0 0x66 0 '
-                '> "$REMOTE_DIR/coremark.log" 2>&1 &'
-            ),
+            f"COREMARK_EXEC={_shell_quote_single(coremark_exec_cmd)}",
+            'if [ "$CGROUP_ENABLED" -eq 1 ]; then',
+            '  bash -lc "echo \\$$ > \"$CGROUP_PATH/cgroup.procs\"; exec bash -lc \"$COREMARK_EXEC\"" &',
+            'else',
+            '  bash -lc "$COREMARK_EXEC" &',
+            'fi',
             "COREMARK_PID=$!",
             'tail -n +1 -f "$REMOTE_DIR/coremark.log" &',
             "TAIL_PID=$!",
@@ -575,6 +591,7 @@ def start_coremark_benchmark(
             'kill "$HEARTBEAT_PID" >/dev/null 2>&1 || true',
             'wait "$TAIL_PID" >/dev/null 2>&1 || true',
             'wait "$HEARTBEAT_PID" >/dev/null 2>&1 || true',
+            'if [ "$CGROUP_ENABLED" -eq 1 ]; then rmdir "$CGROUP_PATH" >/dev/null 2>&1 || true; fi',
             'echo "__COREMARK_EXIT_CODE__=$EXIT_CODE"',
             'if [ "$EXIT_CODE" -ne 0 ] && [ "$EXIT_CODE" -ne 124 ]; then exit "$EXIT_CODE"; fi',
             'echo "__COREMARK_DONE__"',
@@ -764,6 +781,41 @@ def _shell_quote_single(value: str) -> str:
     return "'" + (value or "").replace("'", "'\"'\"'") + "'"
 
 
+
+
+def _build_cgroup_v2_setup_commands(
+    *,
+    cgroup_name_prefix: str,
+    cgroup_cpu_cores: Optional[int],
+    cgroup_memory_mib: Optional[int],
+) -> List[str]:
+    if cgroup_cpu_cores is None and cgroup_memory_mib is None:
+        return [
+            "CGROUP_ENABLED=0",
+            'echo "__CGROUP__ disabled"',
+        ]
+
+    commands = [
+        "CGROUP_ENABLED=1",
+        f"CGROUP_CPU_CORES={int(cgroup_cpu_cores) if cgroup_cpu_cores is not None else 0}",
+        f"CGROUP_MEMORY_MIB={int(cgroup_memory_mib) if cgroup_memory_mib is not None else 0}",
+        f"CGROUP_NAME_PREFIX={_shell_quote_single(re.sub(r'[^a-zA-Z0-9_-]', '-', cgroup_name_prefix).strip('-') or 'benchmark')}",
+        'if [ "$(id -u)" -ne 0 ]; then echo "__CGROUP_ERROR__ root privileges are required for cgroup v2"; exit 126; fi',
+        'if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then echo "__CGROUP_ERROR__ cgroup v2 not detected"; exit 126; fi',
+        'if ! grep -qw cpu /sys/fs/cgroup/cgroup.controllers; then echo "__CGROUP_ERROR__ cpu controller unavailable"; exit 126; fi',
+        'if ! grep -qw memory /sys/fs/cgroup/cgroup.controllers; then echo "__CGROUP_ERROR__ memory controller unavailable"; exit 126; fi',
+        'if ! grep -qw cpu /sys/fs/cgroup/cgroup.subtree_control; then echo "+cpu" > /sys/fs/cgroup/cgroup.subtree_control; fi',
+        'if ! grep -qw memory /sys/fs/cgroup/cgroup.subtree_control; then echo "+memory" > /sys/fs/cgroup/cgroup.subtree_control; fi',
+        'CGROUP_NAME="${CGROUP_NAME_PREFIX}-$(date +%s)-$$"',
+        'CGROUP_PATH="/sys/fs/cgroup/${CGROUP_NAME}"',
+        'mkdir -p "$CGROUP_PATH"',
+        'if [ "$CGROUP_CPU_CORES" -gt 0 ]; then echo "$((CGROUP_CPU_CORES * 100000)) 100000" > "$CGROUP_PATH/cpu.max"; fi',
+        'if [ "$CGROUP_MEMORY_MIB" -gt 0 ]; then echo "$((CGROUP_MEMORY_MIB * 1024 * 1024))" > "$CGROUP_PATH/memory.max"; fi',
+        'echo "__CGROUP__ path=$CGROUP_PATH cpu_cores=${CGROUP_CPU_CORES} memory_mib=${CGROUP_MEMORY_MIB}"',
+    ]
+    return commands
+
+
 def _wait_command_success(
     ssm_client: Any,
     *,
@@ -919,6 +971,9 @@ def start_fio_benchmark(
     upload_bundle: bool = True,
     upload_timeout_seconds: int = 600,
     timeout_seconds: int = 600,
+    cgroup_cpu_cores: Optional[int] = None,
+    cgroup_memory_mib: Optional[int] = None,
+    cgroup_name_prefix: str = "benchmark-fio",
 ) -> str:
     safe_fio_cmd = _shell_quote_single(fio_command)
     safe_cleanup = cleanup_glob.strip() or "/mnt/fio/*"
@@ -997,9 +1052,22 @@ def start_fio_benchmark(
             's#--ioengine[[:space:]]\\+libaio#--ioengine=$REMOTE_ENGINE#g")'
         ),
         'echo "__FIO_COMMAND_RESOLVED__=$FIO_CMD_RESOLVED"',
+    ]
+    commands.extend(
+        _build_cgroup_v2_setup_commands(
+            cgroup_name_prefix=cgroup_name_prefix,
+            cgroup_cpu_cores=cgroup_cpu_cores,
+            cgroup_memory_mib=cgroup_memory_mib,
+        )
+    )
+    commands.extend([
         "EXIT_CODE=0",
         'touch "$REMOTE_LOG"',
-        '(eval "$FIO_CMD_RESOLVED" > "$REMOTE_LOG" 2>&1) &',
+        'if [ "$CGROUP_ENABLED" -eq 1 ]; then',
+        '  bash -lc "echo \\$$ > \"$CGROUP_PATH/cgroup.procs\"; exec bash -lc \"$FIO_CMD_RESOLVED\"" > "$REMOTE_LOG" 2>&1 &',
+        'else',
+        '  (eval "$FIO_CMD_RESOLVED" > "$REMOTE_LOG" 2>&1) &',
+        'fi',
         "FIO_PID=$!",
         'tail -n +1 -f "$REMOTE_LOG" &',
         "TAIL_PID=$!",
@@ -1018,10 +1086,11 @@ def start_fio_benchmark(
         "rm -f ${CLEANUP_GLOB} || true",
         'rm -f "$REMOTE_LOG" || true',
         'echo "__FIO_CLEANUP_DONE__"',
+        'if [ "$CGROUP_ENABLED" -eq 1 ]; then rmdir "$CGROUP_PATH" >/dev/null 2>&1 || true; fi',
         'echo "__FIO_EXIT_CODE__=$EXIT_CODE"',
         'if [ "$EXIT_CODE" -ne 0 ]; then exit "$EXIT_CODE"; fi',
         'echo "__FIO_DONE__"',
-    ]
+    ])
     response = ssm_client.send_command(
         InstanceIds=[instance_id],
         DocumentName="AWS-RunShellScript",
