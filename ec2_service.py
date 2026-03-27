@@ -573,12 +573,12 @@ def start_coremark_benchmark(
             'if [ "$CGROUP_ENABLED" -eq 1 ]; then',
             (
                 f'  (echo $$ > "$CGROUP_PATH/cgroup.procs"; '
-                f'timeout {max_duration}s "$REMOTE_DIR/coremark" 0x0 0x0 0x66 {max_threads} '
+                f'timeout {max_duration}s "$REMOTE_DIR/coremark" M{max_threads} 0x0 0x0 0x66 0 '
                 '> "$REMOTE_DIR/coremark.log" 2>&1) &'
             ),
             'else',
             (
-                f'  (timeout {max_duration}s "$REMOTE_DIR/coremark" 0x0 0x0 0x66 {max_threads} '
+                f'  (timeout {max_duration}s "$REMOTE_DIR/coremark" M{max_threads} 0x0 0x0 0x66 0 '
                 '> "$REMOTE_DIR/coremark.log" 2>&1) &'
             ),
             'fi',
