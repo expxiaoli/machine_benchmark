@@ -1595,8 +1595,8 @@ def _run_coremark_test(
         )
         return
 
-    if score is None:
-        result_summary = "CoreMark score not found in output"
+    if score is None and iterations_per_sec is None:
+        result_summary = "CoreMark metrics not found in output"
         st.error(result_summary)
         _insert_test_result(
             {
@@ -1619,7 +1619,13 @@ def _run_coremark_test(
         )
         return
 
-    summary = f"CoreMark score={score}, iterations/sec={iterations_per_sec}, exit_code={exit_code}"
+    metric_value = score if score is not None else iterations_per_sec
+    metric_label = (
+        f"CoreMark score={score}"
+        if score is not None
+        else f"iterations/sec={iterations_per_sec}"
+    )
+    summary = f"{metric_label}, iterations/sec={iterations_per_sec}, exit_code={exit_code}"
     st.success(summary)
     _insert_test_result(
         {
@@ -1631,7 +1637,7 @@ def _run_coremark_test(
             "status": "success",
             "command_id": command_id,
             "test_type": TEST_TYPE_CPU,
-            "metric_value": score,
+            "metric_value": metric_value,
             "metric_unit": "coremark",
             "coremark_score": score,
             "iterations_per_sec": iterations_per_sec,
@@ -2188,8 +2194,8 @@ def _run_cpu_io_test_suite(
                         "error_message": summary,
                     }
                 )
-            elif cpu_score is None:
-                summary = "CoreMark score not found in output"
+            elif cpu_score is None and cpu_iterations_per_sec is None:
+                summary = "CoreMark metrics not found in output"
                 _record_summary("CPU", summary, success=False)
                 _insert_suite_step_result(
                     {
@@ -2213,6 +2219,7 @@ def _run_cpu_io_test_suite(
             else:
                 cpu_score_str = _round_to_int_string(cpu_score)
                 cpu_iter_str = _round_to_int_string(cpu_iterations_per_sec)
+                metric_value = cpu_score if cpu_score is not None else cpu_iterations_per_sec
                 summary = (
                     f"coremark={cpu_score_str}, iterations/sec={cpu_iter_str}, "
                     f"exit_code={cpu_exit_code}"
@@ -2228,7 +2235,7 @@ def _run_cpu_io_test_suite(
                         "status": "success",
                         "command_id": cpu_command_id,
                         "test_type": TEST_TYPE_CPU,
-                        "metric_value": cpu_score,
+                        "metric_value": metric_value,
                         "metric_unit": "coremark",
                         "coremark_score": cpu_score,
                         "iterations_per_sec": cpu_iterations_per_sec,
