@@ -2653,37 +2653,51 @@ def _render_detail_page(clients: Dict[str, object], region: str, instance_id: st
     st.write(f"Local fio bundle root: `{FIO_LINUX_BUNDLE_DIR}`")
 
     st.markdown("#### cgroup v2 Resource Limits")
-    cgroup_cols = st.columns(2)
-    limit_cpu_cores = cgroup_cols[0].number_input(
-        "Limit CPU cores",
-        min_value=1,
-        max_value=max(int(specs.get("vCPU") or 1), 1),
-        value=min(DEFAULT_CGROUP_LIMIT_CPU_CORES, max(int(specs.get("vCPU") or 1), 1)),
-        step=1,
-        help="Hard CPU quota by cgroup v2 cpu.max. All benchmark child processes are included.",
-    )
-    max_memory_gib = max(float(specs.get("MemoryGiB") or 1.0), 1.0)
-    default_memory_gib = min(DEFAULT_CGROUP_LIMIT_MEMORY_GIB, max_memory_gib)
-    limit_memory_gib = cgroup_cols[1].number_input(
-        "Limit memory (GiB)",
-        min_value=0.5,
-        max_value=max_memory_gib,
-        value=float(default_memory_gib),
-        step=0.5,
-        help="Hard memory limit by cgroup v2 memory.max. OOM in benchmark process is treated as failure.",
+    use_cgroup_limit = st.checkbox(
+        "Use cgroup to limit resources",
+        value=False,
+        help="When enabled, benchmark runs with cgroup v2 hard limits; otherwise it uses full machine resources.",
     )
 
-    st.caption(
-        f"Current profile: cgroup-v2 cpu={int(limit_cpu_cores)} mem={float(limit_memory_gib):g}GiB"
-    )
+    limit_cpu_cores: Optional[int] = None
+    limit_memory_gib: Optional[float] = None
+    if use_cgroup_limit:
+        cgroup_cols = st.columns(2)
+        limit_cpu_cores = int(
+            cgroup_cols[0].number_input(
+                "Limit CPU cores",
+                min_value=1,
+                max_value=max(int(specs.get("vCPU") or 1), 1),
+                value=min(DEFAULT_CGROUP_LIMIT_CPU_CORES, max(int(specs.get("vCPU") or 1), 1)),
+                step=1,
+                help="Hard CPU quota by cgroup v2 cpu.max. All benchmark child processes are included.",
+            )
+        )
+        max_memory_gib = max(float(specs.get("MemoryGiB") or 1.0), 1.0)
+        default_memory_gib = min(DEFAULT_CGROUP_LIMIT_MEMORY_GIB, max_memory_gib)
+        limit_memory_gib = float(
+            cgroup_cols[1].number_input(
+                "Limit memory (GiB)",
+                min_value=0.5,
+                max_value=max_memory_gib,
+                value=float(default_memory_gib),
+                step=0.5,
+                help="Hard memory limit by cgroup v2 memory.max. OOM in benchmark process is treated as failure.",
+            )
+        )
+        st.caption(
+            f"Current profile: cgroup-v2 cpu={int(limit_cpu_cores)} mem={float(limit_memory_gib):g}GiB"
+        )
+    else:
+        st.caption("Current profile: unlimited (no cgroup limit)")
 
     if st.button("CPU/IO Test", type="primary"):
         _run_cpu_io_test_suite(
             clients,
             instance,
             specs,
-            cgroup_cpu_cores=int(limit_cpu_cores),
-            cgroup_memory_gib=float(limit_memory_gib),
+            cgroup_cpu_cores=limit_cpu_cores,
+            cgroup_memory_gib=limit_memory_gib,
         )
 
     st.markdown("### Instance Details")
