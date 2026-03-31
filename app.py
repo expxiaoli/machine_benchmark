@@ -118,6 +118,18 @@ CPU_ITERATIONS_PER_SEC_PATTERNS = (
 )
 
 
+def _detect_coremark_output_issue(raw_output: str, *, thread_count: int) -> Optional[str]:
+    output = raw_output or ""
+    if "Errors detected" in output or "Must execute for at least 10 secs" in output:
+        return "CoreMark output invalid: errors detected or runtime below 10 seconds"
+    if thread_count > 1 and "awk:" in output and "syntax error" in output.lower():
+        return (
+            "CoreMark output invalid: awk aggregation failed in multi-thread mode; "
+            "CPU score may be silently under-reported"
+        )
+    return None
+
+
 st.set_page_config(page_title="EC2 Manager", page_icon=":cloud:", layout="wide")
 st.title("AWS EC2 Benchmark")
 st.caption("Create, list, search, and manage EC2 instances from a local AWS env file.")
@@ -359,6 +371,7 @@ def _create_test_results_table(
             status TEXT NOT NULL,
             cpu_score REAL,
             cpu_iterations_per_sec REAL,
+            cpu_test_threads INTEGER,
             seqwrite_bw_mib_s REAL,
             seqwrite_iops REAL,
             seqwrite_disk_util_pct REAL,
@@ -399,6 +412,7 @@ def _migrate_test_results_remove_summary_columns(
         "status",
         "cpu_score",
         "cpu_iterations_per_sec",
+        "cpu_test_threads",
         "seqwrite_bw_mib_s",
         "seqwrite_iops",
         "seqwrite_disk_util_pct",
@@ -487,6 +501,7 @@ def _init_test_results_db() -> None:
         "status",
         "cpu_score",
         "cpu_iterations_per_sec",
+        "cpu_test_threads",
         "seqwrite_bw_mib_s",
         "seqwrite_iops",
         "seqwrite_disk_util_pct",
@@ -520,6 +535,7 @@ def _init_test_results_db() -> None:
         "status": "TEXT",
         "cpu_score": "REAL",
         "cpu_iterations_per_sec": "REAL",
+        "cpu_test_threads": "INTEGER",
         "seqwrite_bw_mib_s": "REAL",
         "seqwrite_iops": "REAL",
         "seqwrite_disk_util_pct": "REAL",
@@ -599,6 +615,7 @@ def _insert_test_result(record: Dict[str, object]) -> Optional[int]:
         status,
         record.get("cpu_score"),
         record.get("cpu_iterations_per_sec"),
+        record.get("cpu_test_threads"),
         record.get("seqwrite_bw_mib_s"),
         record.get("seqwrite_iops"),
         record.get("seqwrite_disk_util_pct"),
@@ -637,6 +654,7 @@ def _insert_test_result(record: Dict[str, object]) -> Optional[int]:
                         status,
                         cpu_score,
                         cpu_iterations_per_sec,
+                        cpu_test_threads,
                         seqwrite_bw_mib_s,
                         seqwrite_iops,
                         seqwrite_disk_util_pct,
@@ -658,7 +676,7 @@ def _insert_test_result(record: Dict[str, object]) -> Optional[int]:
                         result_summary,
                         raw_output,
                         error_message
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     insert_params,
                 )
@@ -689,6 +707,7 @@ def _load_test_results(limit: int = 200) -> List[Dict[str, object]]:
                 status,
                 cpu_score,
                 cpu_iterations_per_sec,
+                cpu_test_threads,
                 seqwrite_bw_mib_s,
                 seqwrite_iops,
                 seqwrite_disk_util_pct,
@@ -1458,12 +1477,16 @@ def _render_create_page(clients: Dict[str, object], region: str) -> None:
 
 
 def _run_coremark_test(
-    clients: Dict[str, object], instance: Dict[str, object], specs: Dict[str, object]
+    clients: Dict[str, object],
+    instance: Dict[str, object],
+    specs: Dict[str, object],
+    *,
+    cpu_threads: int = 16,
 ) -> None:
     instance_id = str(instance["InstanceId"])
     duration_seconds = 30
     remote_dir = "/tmp/coremark_streamlit"
-    cpu_threads = max(int(specs.get("vCPU") or 1), 1)
+    cpu_threads = max(int(cpu_threads), 1)
     remote_command = (
         f"parallel_coremark workers={cpu_threads}, per_worker='timeout {duration_seconds}s {remote_dir}/coremark 0x0 0x0 0x66 0'"
     )
@@ -1487,6 +1510,7 @@ def _run_coremark_test(
                 "metric_unit": "coremark",
                 "coremark_score": None,
                 "iterations_per_sec": None,
+                "cpu_test_threads": cpu_threads,
                 "result_summary": "CoreMark binary missing",
                 "raw_output": "",
                 "error_message": error_message,
@@ -1520,6 +1544,7 @@ def _run_coremark_test(
                 "metric_unit": "coremark",
                 "coremark_score": None,
                 "iterations_per_sec": None,
+                "cpu_test_threads": cpu_threads,
                 "result_summary": "Failed to start test",
                 "raw_output": "",
                 "error_message": message,
@@ -1545,9 +1570,9 @@ def _run_coremark_test(
     exit_code = parsed.get("exit_code")
     score = parsed.get("coremark_score")
     iterations_per_sec = parsed.get("iterations_per_sec")
-    cpu_output_invalid = (
-        "Errors detected" in combined_output
-        or "Must execute for at least 10 secs" in combined_output
+    coremark_output_issue = _detect_coremark_output_issue(
+        combined_output,
+        thread_count=cpu_threads,
     )
 
     if poll_error:
@@ -1567,6 +1592,7 @@ def _run_coremark_test(
                 "metric_unit": "coremark",
                 "coremark_score": score,
                 "iterations_per_sec": iterations_per_sec,
+                "cpu_test_threads": cpu_threads,
                 "result_summary": result_summary,
                 "raw_output": combined_output,
                 "error_message": poll_error,
@@ -1591,6 +1617,7 @@ def _run_coremark_test(
                 "metric_unit": "coremark",
                 "coremark_score": score,
                 "iterations_per_sec": iterations_per_sec,
+                "cpu_test_threads": cpu_threads,
                 "result_summary": result_summary,
                 "raw_output": combined_output,
                 "error_message": result_summary,
@@ -1598,8 +1625,8 @@ def _run_coremark_test(
         )
         return
 
-    if cpu_output_invalid:
-        result_summary = "CoreMark output invalid: errors detected or runtime below 10 seconds"
+    if coremark_output_issue:
+        result_summary = coremark_output_issue
         st.error(result_summary)
         _insert_test_result(
             {
@@ -1615,6 +1642,7 @@ def _run_coremark_test(
                 "metric_unit": "coremark",
                 "coremark_score": score,
                 "iterations_per_sec": iterations_per_sec,
+                "cpu_test_threads": cpu_threads,
                 "result_summary": result_summary,
                 "raw_output": combined_output,
                 "error_message": result_summary,
@@ -1639,6 +1667,7 @@ def _run_coremark_test(
                 "metric_unit": "coremark",
                 "coremark_score": None,
                 "iterations_per_sec": iterations_per_sec,
+                "cpu_test_threads": cpu_threads,
                 "result_summary": result_summary,
                 "raw_output": combined_output,
                 "error_message": result_summary,
@@ -1668,6 +1697,7 @@ def _run_coremark_test(
             "metric_unit": "coremark",
             "coremark_score": score,
             "iterations_per_sec": iterations_per_sec,
+            "cpu_test_threads": cpu_threads,
             "result_summary": summary,
             "raw_output": combined_output,
             "error_message": None,
@@ -1883,6 +1913,7 @@ def _run_cpu_io_test_suite(
     instance: Dict[str, object],
     specs: Dict[str, object],
     *,
+    cpu_threads: int = 16,
     cgroup_cpu_cores: Optional[int] = None,
     cgroup_memory_gib: Optional[float] = None,
 ) -> None:
@@ -1898,10 +1929,12 @@ def _run_cpu_io_test_suite(
         cgroup_memory_mib = int(float(cgroup_memory_gib) * 1024)
         cgroup_profile = f"cgroup-v2 cpu={int(cgroup_cpu_cores)} mem={float(cgroup_memory_gib):g}GiB"
 
+    configured_cpu_threads = max(int(cpu_threads), 1)
     live_output_lines: List[str] = [
         f"# CPU/IO Test Suite started at {suite_time}",
         f"# instance_id={instance_id}",
         f"# resource_profile={cgroup_profile}",
+        f"# cpu_threads={configured_cpu_threads}",
     ]
     log_placeholder.code("\n".join(live_output_lines), language="bash")
 
@@ -1931,6 +1964,7 @@ def _run_cpu_io_test_suite(
         "status": "error",
         "cpu_score": None,
         "cpu_iterations_per_sec": None,
+        "cpu_test_threads": configured_cpu_threads,
         "seqwrite_bw_mib_s": None,
         "seqwrite_iops": None,
         "seqwrite_disk_util_pct": None,
@@ -2074,14 +2108,13 @@ def _run_cpu_io_test_suite(
     cpu_test_time = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     cpu_duration_seconds = 30
     cpu_remote_dir = "/tmp/coremark_streamlit"
-    cpu_threads = max(int(cgroup_cpu_cores or specs.get("vCPU") or 1), 1)
     _append_live_output_block(
         live_output_lines,
         log_placeholder,
-        f"[CPU] thread_count={cpu_threads}",
+        f"[CPU] thread_count={configured_cpu_threads}",
     )
     cpu_command = (
-        f"parallel_coremark workers={cpu_threads}, per_worker='timeout {cpu_duration_seconds}s {cpu_remote_dir}/coremark 0x0 0x0 0x66 0'"
+        f"parallel_coremark workers={configured_cpu_threads}, per_worker='timeout {cpu_duration_seconds}s {cpu_remote_dir}/coremark 0x0 0x0 0x66 0'"
     )
     if coremark_bundle_error or not coremark_bundle:
         error_message = (
@@ -2100,12 +2133,13 @@ def _run_cpu_io_test_suite(
                 "command_id": None,
                 "test_type": TEST_TYPE_CPU,
                 "metric_value": None,
-                "metric_unit": "coremark",
-                "coremark_score": None,
-                "iterations_per_sec": None,
-                "result_summary": "CoreMark binary missing",
-                "raw_output": "",
-                "error_message": error_message,
+                        "metric_unit": "coremark",
+                        "coremark_score": None,
+                        "iterations_per_sec": None,
+                        "cpu_test_threads": configured_cpu_threads,
+                        "result_summary": "CoreMark binary missing",
+                        "raw_output": "",
+                        "error_message": error_message,
             }
         )
     else:
@@ -2117,7 +2151,7 @@ def _run_cpu_io_test_suite(
                     instance_id=instance_id,
                     linux_binary_path=str(coremark_bundle["coremark_binary"]),
                     duration_seconds=cpu_duration_seconds,
-                    cpu_threads=cpu_threads,
+                    cpu_threads=configured_cpu_threads,
                     upload_binary=coremark_upload_needed,
                     cgroup_cpu_cores=cgroup_cpu_cores,
                     cgroup_memory_mib=cgroup_memory_mib,
@@ -2137,12 +2171,13 @@ def _run_cpu_io_test_suite(
                     "command_id": None,
                     "test_type": TEST_TYPE_CPU,
                     "metric_value": None,
-                    "metric_unit": "coremark",
-                    "coremark_score": None,
-                    "iterations_per_sec": None,
-                    "result_summary": "Failed to start CPU test",
-                    "raw_output": "",
-                    "error_message": message,
+                        "metric_unit": "coremark",
+                        "coremark_score": None,
+                        "iterations_per_sec": None,
+                        "cpu_test_threads": configured_cpu_threads,
+                        "result_summary": "Failed to start CPU test",
+                        "raw_output": "",
+                        "error_message": message,
                 }
             )
         else:
@@ -2173,9 +2208,9 @@ def _run_cpu_io_test_suite(
             cpu_score = cpu_parsed.get("coremark_score")
             cpu_iterations_per_sec = cpu_parsed.get("iterations_per_sec")
             cpu_exit_code = cpu_parsed.get("exit_code")
-            cpu_output_invalid = (
-                "Errors detected" in cpu_output
-                or "Must execute for at least 10 secs" in cpu_output
+            coremark_output_issue = _detect_coremark_output_issue(
+                cpu_output,
+                thread_count=configured_cpu_threads,
             )
             suite_db_record["cpu_score"] = cpu_score
             suite_db_record["cpu_iterations_per_sec"] = cpu_iterations_per_sec
@@ -2197,6 +2232,7 @@ def _run_cpu_io_test_suite(
                         "metric_unit": "coremark",
                         "coremark_score": cpu_score,
                         "iterations_per_sec": cpu_iterations_per_sec,
+                        "cpu_test_threads": configured_cpu_threads,
                         "result_summary": "Failed to poll CPU test",
                         "raw_output": cpu_output,
                         "error_message": str(cpu_poll_error),
@@ -2219,13 +2255,14 @@ def _run_cpu_io_test_suite(
                         "metric_unit": "coremark",
                         "coremark_score": cpu_score,
                         "iterations_per_sec": cpu_iterations_per_sec,
+                        "cpu_test_threads": configured_cpu_threads,
                         "result_summary": summary,
                         "raw_output": cpu_output,
                         "error_message": summary,
                     }
                 )
-            elif cpu_output_invalid:
-                summary = "CoreMark output invalid: errors detected or runtime below 10 seconds"
+            elif coremark_output_issue:
+                summary = coremark_output_issue
                 _record_summary("CPU", summary, success=False)
                 _insert_suite_step_result(
                     {
@@ -2241,6 +2278,7 @@ def _run_cpu_io_test_suite(
                         "metric_unit": "coremark",
                         "coremark_score": cpu_score,
                         "iterations_per_sec": cpu_iterations_per_sec,
+                        "cpu_test_threads": configured_cpu_threads,
                         "result_summary": summary,
                         "raw_output": cpu_output,
                         "error_message": summary,
@@ -2263,6 +2301,7 @@ def _run_cpu_io_test_suite(
                         "metric_unit": "coremark",
                         "coremark_score": None,
                         "iterations_per_sec": cpu_iterations_per_sec,
+                        "cpu_test_threads": configured_cpu_threads,
                         "result_summary": summary,
                         "raw_output": cpu_output,
                         "error_message": summary,
@@ -2291,6 +2330,7 @@ def _run_cpu_io_test_suite(
                         "metric_unit": "coremark",
                         "coremark_score": cpu_score,
                         "iterations_per_sec": cpu_iterations_per_sec,
+                        "cpu_test_threads": configured_cpu_threads,
                         "result_summary": summary,
                         "raw_output": cpu_output,
                         "error_message": None,
@@ -2719,6 +2759,15 @@ def _render_detail_page(clients: Dict[str, object], region: str, instance_id: st
     )
     st.write(f"Local CoreMark bundle root: `{COREMARK_LINUX_BUNDLE_DIR}`")
     st.write(f"Local fio bundle root: `{FIO_LINUX_BUNDLE_DIR}`")
+    cpu_test_threads = int(
+        st.number_input(
+            "threads for CPU test",
+            min_value=1,
+            value=16,
+            step=1,
+            help="Number of parallel CoreMark workers used in benchmark CPU test.",
+        )
+    )
 
     st.markdown("#### cgroup v2 Resource Limits")
     use_cgroup_limit = st.checkbox(
@@ -2764,6 +2813,7 @@ def _render_detail_page(clients: Dict[str, object], region: str, instance_id: st
             clients,
             instance,
             specs,
+            cpu_threads=cpu_test_threads,
             cgroup_cpu_cores=limit_cpu_cores,
             cgroup_memory_gib=limit_memory_gib,
         )
@@ -2936,6 +2986,7 @@ def _render_test_results_page() -> None:
                 "Resource Profile": item.get("cgroup_profile") or "unlimited",
                 "Limit CPU": _round_to_int_string(item.get("cgroup_cpu_cores")),
                 "Limit Memory (GiB)": _format_test_metric(item.get("cgroup_memory_gib"), "GiB", fallback=""),
+                "CPU Test Threads": _round_to_int_string(item.get("cpu_test_threads")),
                 "CPU Iterations/sec": _format_test_metric(
                     cpu_iterations_per_sec, "", fallback=""
                 ),
