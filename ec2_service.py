@@ -571,17 +571,19 @@ def start_coremark_benchmark(
             'rm -f "$REMOTE_DIR/coremark.log" "$REMOTE_DIR"/coremark-*.log',
             'touch "$REMOTE_DIR/coremark.log"',
             'if [ "$CGROUP_ENABLED" -eq 1 ]; then',
+            '  if [ -f "$CGROUP_PATH/cpu.max" ]; then echo "__CGROUP_CPU_MAX__ $(cat "$CGROUP_PATH/cpu.max")"; fi',
+            '  if [ -f "$CGROUP_PATH/memory.max" ]; then echo "__CGROUP_MEMORY_MAX__ $(cat "$CGROUP_PATH/memory.max")"; fi',
             (
                 f'  (EXIT_CODE=0; PIDS=""; '
                 f'for i in $(seq 1 {max_threads}); do '
                 f'WORKER_LOG="$REMOTE_DIR/coremark-$i.log"; '
                 f'touch "$WORKER_LOG"; '
-                f'(echo $$ > "$CGROUP_PATH/cgroup.procs"; timeout {max_duration}s "$REMOTE_DIR/coremark" 0x0 0x0 0x66 0 > "$WORKER_LOG" 2>&1) & '
+                f'(sh -c \'echo $$ > "$1"; CGROUP_INFO=$(tr "\\n" ";" < /proc/$$/cgroup); echo "__CGROUP_ATTACH__ worker=$4 pid=$$ cgroup=$CGROUP_INFO"; exec timeout "$2" "$3" 0x0 0x0 0x66 0\' _ "$CGROUP_PATH/cgroup.procs" "{max_duration}s" "$REMOTE_DIR/coremark" "$i" > "$WORKER_LOG" 2>&1) & '
                 f'PIDS="$PIDS $!"; '
                 f'done; '
                 f'for pid in $PIDS; do wait "$pid" || EXIT_CODE=$?; done; '
                 f'cat "$REMOTE_DIR"/coremark-*.log > "$REMOTE_DIR/coremark.log" || true; '
-                f'SUM_ITER=$(grep -h "Iterations/Sec" "$REMOTE_DIR"/coremark-*.log | awk -F":" "{{sum += \\$2}} END {{if (NR>0) printf \"%.6f\", sum}}" || true); '
+                f'SUM_ITER=$(grep -h "Iterations/Sec" "$REMOTE_DIR"/coremark-*.log | awk -F":" \'{{sum += $2}} END {{if (NR>0) printf "%.6f", sum}}\' || true); '
                 f'if [ -n "$SUM_ITER" ]; then echo "Iterations/Sec : $SUM_ITER" >> "$REMOTE_DIR/coremark.log"; echo "CoreMark 1.0 : $SUM_ITER / aggregate" >> "$REMOTE_DIR/coremark.log"; fi; '
                 f'if grep -q "Errors detected\|Must execute for at least 10 secs" "$REMOTE_DIR/coremark.log"; then EXIT_CODE=125; fi; '
                 f'exit "$EXIT_CODE") &'
@@ -597,7 +599,7 @@ def start_coremark_benchmark(
                 f'done; '
                 f'for pid in $PIDS; do wait "$pid" || EXIT_CODE=$?; done; '
                 f'cat "$REMOTE_DIR"/coremark-*.log > "$REMOTE_DIR/coremark.log" || true; '
-                f'SUM_ITER=$(grep -h "Iterations/Sec" "$REMOTE_DIR"/coremark-*.log | awk -F":" "{{sum += \\$2}} END {{if (NR>0) printf \"%.6f\", sum}}" || true); '
+                f'SUM_ITER=$(grep -h "Iterations/Sec" "$REMOTE_DIR"/coremark-*.log | awk -F":" \'{{sum += $2}} END {{if (NR>0) printf "%.6f", sum}}\' || true); '
                 f'if [ -n "$SUM_ITER" ]; then echo "Iterations/Sec : $SUM_ITER" >> "$REMOTE_DIR/coremark.log"; echo "CoreMark 1.0 : $SUM_ITER / aggregate" >> "$REMOTE_DIR/coremark.log"; fi; '
                 f'if grep -q "Errors detected\|Must execute for at least 10 secs" "$REMOTE_DIR/coremark.log"; then EXIT_CODE=125; fi; '
                 f'exit "$EXIT_CODE") &'
@@ -1090,7 +1092,9 @@ def start_fio_benchmark(
         "EXIT_CODE=0",
         'touch "$REMOTE_LOG"',
         'if [ "$CGROUP_ENABLED" -eq 1 ]; then',
-        '  (echo $$ > "$CGROUP_PATH/cgroup.procs"; eval "$FIO_CMD_RESOLVED" > "$REMOTE_LOG" 2>&1) &',
+        '  if [ -f "$CGROUP_PATH/cpu.max" ]; then echo "__CGROUP_CPU_MAX__ $(cat "$CGROUP_PATH/cpu.max")"; fi',
+        '  if [ -f "$CGROUP_PATH/memory.max" ]; then echo "__CGROUP_MEMORY_MAX__ $(cat "$CGROUP_PATH/memory.max")"; fi',
+        '  (sh -c \'echo $$ > "$1"; CGROUP_INFO=$(tr "\\n" ";" < /proc/$$/cgroup); echo "__CGROUP_ATTACH__ pid=$$ cgroup=$CGROUP_INFO"; eval "$2"\' _ "$CGROUP_PATH/cgroup.procs" "$FIO_CMD_RESOLVED" > "$REMOTE_LOG" 2>&1) &',
         'else',
         '  (eval "$FIO_CMD_RESOLVED" > "$REMOTE_LOG" 2>&1) &',
         'fi',
