@@ -30,6 +30,7 @@ from ec2_service import (
     get_instance,
     list_instance_families,
     list_instances,
+    get_instance_type_specs_map,
     parse_security_group_ids,
     suggest_instance_types,
     wait_for_ssm_online,
@@ -214,9 +215,27 @@ def _refresh_instance_cache(
     ec2_client: object, include_terminated: bool = False
 ) -> List[Dict[str, object]]:
     items = list_instances(ec2_client, include_terminated=include_terminated)
-    st.session_state["instance_cache"] = items
+
+    specs_by_type: Dict[str, Dict[str, object]] = {}
+    try:
+        specs_by_type = get_instance_type_specs_map(
+            ec2_client,
+            [str(item.get("InstanceType", "") or "") for item in items],
+        )
+    except ClientError:
+        specs_by_type = {}
+
+    enriched_items: List[Dict[str, object]] = []
+    for item in items:
+        enriched_item = dict(item)
+        specs = specs_by_type.get(str(item.get("InstanceType", "") or ""))
+        enriched_item["vCPU"] = specs.get("vCPU") if specs else None
+        enriched_item["MemoryGiB"] = specs.get("MemoryGiB") if specs else None
+        enriched_items.append(enriched_item)
+
+    st.session_state["instance_cache"] = enriched_items
     st.session_state["instance_list_include_terminated"] = include_terminated
-    return items
+    return enriched_items
 
 
 def _query_param_value(name: str, default: str = "") -> str:
@@ -765,6 +784,16 @@ def _round_to_int_string(value: object) -> str:
         return str(value)
 
 
+def _format_compact_number(value: object, fallback: str = "") -> str:
+    if value is None or value == "":
+        return fallback
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return f"{number:.2f}".rstrip("0").rstrip(".")
+
+
 def _format_test_metric(value: object, unit: str, fallback: str = "") -> str:
     rounded = _round_to_int_string(value)
     if rounded:
@@ -813,7 +842,8 @@ def _render_instance_table(rows: List[Dict[str, object]]) -> None:
         "Instance Type",
         "Private IP",
         "Public IP",
-        "Image ID",
+        "vCPU",
+        "Memory (GiB)",
         "Launch Time",
     ]
     lines = [
@@ -828,11 +858,12 @@ def _render_instance_table(rows: List[Dict[str, object]]) -> None:
         instance_type = _md_escape(row.get("InstanceType", ""))
         private_ip = _md_escape(row.get("PrivateIpAddress", ""))
         public_ip = _md_escape(row.get("PublicIpAddress", ""))
-        image_id = _md_escape(row.get("ImageId", ""))
+        vcpu = _md_escape(_round_to_int_string(row.get("vCPU")) or "N/A")
+        memory_gib = _md_escape(_format_compact_number(row.get("MemoryGiB"), fallback="N/A"))
         launch_time = _md_escape(row.get("LaunchTime", ""))
 
         link = f"[{instance_id}]({_instance_detail_url(instance_id)})"
-        values = [link, name, state, instance_type, private_ip, public_ip, image_id, launch_time]
+        values = [link, name, state, instance_type, private_ip, public_ip, vcpu, memory_gib, launch_time]
         lines.append("| " + " | ".join(values) + " |")
 
     st.markdown("\n".join(lines))

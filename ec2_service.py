@@ -491,6 +491,39 @@ def get_instance_type_specs(ec2_client: Any, instance_type: str) -> Dict[str, An
     }
 
 
+def get_instance_type_specs_map(
+    ec2_client: Any, instance_types: List[str]
+) -> Dict[str, Dict[str, Any]]:
+    unique_instance_types = sorted(
+        {
+            str(instance_type).strip()
+            for instance_type in instance_types
+            if str(instance_type).strip()
+        }
+    )
+    if not unique_instance_types:
+        return {}
+
+    specs_by_type: Dict[str, Dict[str, Any]] = {}
+    batch_size = 100
+    for start_index in range(0, len(unique_instance_types), batch_size):
+        batch = unique_instance_types[start_index : start_index + batch_size]
+        response = ec2_client.describe_instance_types(InstanceTypes=batch)
+        for item in response.get("InstanceTypes", []):
+            instance_type = item.get("InstanceType", "")
+            vcpu = item.get("VCpuInfo", {}).get("DefaultVCpus")
+            memory_mib = item.get("MemoryInfo", {}).get("SizeInMiB")
+            specs_by_type[instance_type] = {
+                "InstanceType": instance_type,
+                "vCPU": vcpu,
+                "MemoryGiB": round((memory_mib or 0) / 1024.0, 2)
+                if memory_mib
+                else None,
+            }
+
+    return specs_by_type
+
+
 def start_coremark_benchmark(
     ssm_client: Any,
     *,
