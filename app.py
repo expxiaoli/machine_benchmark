@@ -21,25 +21,31 @@ from aws_env import (
 )
 from ec2_service import (
     associate_instance_profile,
-    create_instance,
     create_key_pair,
     ensure_ssm_role_and_profile,
     ensure_ssm_vpc_endpoints,
-    get_command_invocation,
     get_instance_type_specs,
     get_al2023_ami_id,
     get_default_network,
     get_instance,
     list_instance_families,
     list_instances,
-    parse_coremark_result,
-    parse_fio_result,
     parse_security_group_ids,
-    start_coremark_benchmark,
-    start_fio_benchmark,
     suggest_instance_types,
-    terminate_instances,
     wait_for_ssm_online,
+)
+from scripts.lib import (
+    COREMARK_LINUX_BUNDLE_DIR,
+    FIO_LINUX_BUNDLE_DIR,
+    create_ec2_instance,
+    probe_remote_coremark_exists,
+    probe_remote_fio_exists,
+    resolve_coremark_bundle_for_arch,
+    resolve_fio_bundle_for_arch,
+    run_coremark_once,
+    run_fio_once,
+    run_shell_command_once,
+    terminate_ec2_instances,
 )
 
 
@@ -56,18 +62,6 @@ VIEW_TO_LABEL = {
 }
 
 APP_DIR = Path(__file__).resolve().parent
-COREMARK_LINUX_BUNDLE_DIR = APP_DIR / "bin" / "coremark"
-COREMARK_ARCH_TO_BUNDLE_DIR = {
-    "x86_64": "x86_64",
-    "arm64": "arm64",
-    "aarch64": "arm64",
-}
-FIO_LINUX_BUNDLE_DIR = APP_DIR / "bin" / "fio"
-FIO_ARCH_TO_BUNDLE_DIR = {
-    "x86_64": "x86_64",
-    "arm64": "arm64",
-    "aarch64": "arm64",
-}
 TEST_RESULTS_DB_PATH = APP_DIR / "test_results.db"
 TEST_RESULTS_DB_CONNECT_TIMEOUT_SECONDS = 30.0
 TEST_RESULTS_DB_BUSY_TIMEOUT_MS = 30_000
@@ -265,66 +259,6 @@ def _data_loading_scope() -> object:
     _notify_data_loading()
     with st.spinner("data loading"):
         yield
-
-
-def _resolve_fio_bundle(instance: Dict[str, object]) -> Dict[str, object]:
-    arch = str(instance.get("Architecture") or "").strip().lower()
-    bundle_dir_name = FIO_ARCH_TO_BUNDLE_DIR.get(arch)
-    if not arch:
-        raise RuntimeError(
-            "Instance architecture is unavailable. Refresh instance detail and try again."
-        )
-    if not bundle_dir_name:
-        raise RuntimeError(f"Unsupported architecture for fio bundle: {arch}")
-
-    bundle_root = FIO_LINUX_BUNDLE_DIR / bundle_dir_name
-    fio_binary = bundle_root / "fio"
-    fio_engine = bundle_root / "engines" / "fio-libaio.so"
-    shared_libs = [
-        bundle_root / "lib" / "libaio.so.1",
-        bundle_root / "lib" / "libaio.so.1.0.1",
-        bundle_root / "lib" / "libnuma.so.1",
-        bundle_root / "lib" / "libnuma.so.1.0.0",
-    ]
-
-    required_paths = [fio_binary, fio_engine, *shared_libs]
-    missing = [str(path) for path in required_paths if not path.exists()]
-    if missing:
-        raise RuntimeError(
-            "Local fio bundle files are missing:\n" + "\n".join(missing)
-        )
-
-    return {
-        "architecture": arch,
-        "bundle_root": bundle_root,
-        "fio_binary": fio_binary,
-        "fio_engine": fio_engine,
-        "shared_libs": shared_libs,
-    }
-
-
-def _resolve_coremark_bundle(instance: Dict[str, object]) -> Dict[str, object]:
-    arch = str(instance.get("Architecture") or "").strip().lower()
-    bundle_dir_name = COREMARK_ARCH_TO_BUNDLE_DIR.get(arch)
-    if not arch:
-        raise RuntimeError(
-            "Instance architecture is unavailable. Refresh instance detail and try again."
-        )
-    if not bundle_dir_name:
-        raise RuntimeError(f"Unsupported architecture for coremark bundle: {arch}")
-
-    bundle_root = COREMARK_LINUX_BUNDLE_DIR / bundle_dir_name
-    coremark_binary = bundle_root / "coremark"
-    if not coremark_binary.exists() or not coremark_binary.is_file():
-        raise RuntimeError(
-            "Local coremark binary file is missing:\n" + str(coremark_binary)
-        )
-
-    return {
-        "architecture": arch,
-        "bundle_root": bundle_root,
-        "coremark_binary": coremark_binary,
-    }
 
 
 def _connect_test_results_db() -> sqlite3.Connection:
@@ -852,178 +786,6 @@ def _format_percent_metric(value: object, fallback: str = "") -> str:
     return f"{normalized}%"
 
 
-def _poll_command_with_live_output(
-    clients: Dict[str, object],
-    *,
-    instance_id: str,
-    command_id: str,
-    command_text: str,
-    marker_prefixes_to_skip: Optional[List[str]] = None,
-    max_polls: int = 240,
-    poll_interval_seconds: int = 2,
-    show_live_heading: bool = True,
-    log_placeholder: Optional[object] = None,
-    status_placeholder: Optional[object] = None,
-    live_output_lines: Optional[List[str]] = None,
-    running_marker_prefix: str = "__RUNNING__",
-) -> Dict[str, object]:
-    if show_live_heading:
-        st.markdown("**Live output**")
-    local_log_placeholder = log_placeholder or st.empty()
-    local_status_placeholder = status_placeholder or st.empty()
-    terminal_status = {"Success", "Failed", "Cancelled", "TimedOut", "Cancelling"}
-    marker_prefixes = marker_prefixes_to_skip or []
-
-    combined_output = ""
-    last_remote_output = ""
-    lines = live_output_lines if live_output_lines is not None else []
-    if lines:
-        lines.append("")
-    lines.append(f"$ {command_text}")
-    local_log_placeholder.code("\n".join(lines[-4000:]), language="bash")
-    status = "Pending"
-    poll_error: Optional[str] = None
-    poll_start_time = time.time()
-
-    def _append_live_output(new_text: str) -> None:
-        if not new_text:
-            return
-        filtered_lines: List[str] = []
-        for line in new_text.splitlines():
-            if any(line.startswith(prefix) for prefix in marker_prefixes):
-                continue
-            filtered_lines.append(line)
-        chunk = "\n".join(filtered_lines).strip()
-        if not chunk:
-            return
-        lines.extend(chunk.splitlines())
-
-    for _ in range(max_polls):
-        try:
-            invocation = get_command_invocation(
-                clients["ssm"],
-                command_id=command_id,
-                instance_id=instance_id,
-            )
-            status = str(invocation.get("Status", "Pending"))
-            stdout = str(invocation.get("StandardOutputContent", "") or "")
-            stderr = str(invocation.get("StandardErrorContent", "") or "")
-            combined_output = stdout + (f"\n{stderr}" if stderr else "")
-            elapsed_seconds = int(time.time() - poll_start_time)
-            local_status_placeholder.write(
-                f"Command status: `{status}` | Elapsed: `{elapsed_seconds}s` | Refresh every {poll_interval_seconds}s"
-            )
-
-            if combined_output != last_remote_output:
-                if combined_output.startswith(last_remote_output):
-                    delta = combined_output[len(last_remote_output) :]
-                else:
-                    delta = combined_output
-                _append_live_output(delta)
-                last_remote_output = combined_output
-
-            if status not in terminal_status:
-                heartbeat = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-                lines.append(f"{running_marker_prefix} {heartbeat}")
-
-            local_log_placeholder.code("\n".join(lines[-4000:]), language="bash")
-            if status in terminal_status:
-                break
-            time.sleep(poll_interval_seconds)
-        except ClientError as error:
-            poll_error = str(error)
-            break
-
-    return {
-        "status": status,
-        "poll_error": poll_error,
-        "combined_output": combined_output,
-        "live_output_lines": lines,
-    }
-
-
-def _run_ssm_probe_command(
-    clients: Dict[str, object],
-    *,
-    instance_id: str,
-    commands: List[str],
-    timeout_seconds: int = 90,
-    poll_interval_seconds: int = 2,
-    comment: str = "Probe remote runtime",
-) -> Dict[str, str]:
-    response = clients["ssm"].send_command(
-        InstanceIds=[instance_id],
-        DocumentName="AWS-RunShellScript",
-        Parameters={"commands": commands},
-        TimeoutSeconds=max(timeout_seconds, 30),
-        Comment=comment,
-    )
-    command_id = response["Command"]["CommandId"]
-    terminal_status = {"Success", "Failed", "Cancelled", "TimedOut", "Cancelling"}
-    deadline = time.time() + max(timeout_seconds, 30)
-
-    while time.time() < deadline:
-        invocation = get_command_invocation(
-            clients["ssm"],
-            command_id=command_id,
-            instance_id=instance_id,
-        )
-        status = str(invocation.get("Status", "Pending"))
-        if status in terminal_status:
-            stdout = str(invocation.get("StandardOutputContent", "") or "")
-            stderr = str(invocation.get("StandardErrorContent", "") or "")
-            return {
-                "status": status,
-                "stdout": stdout,
-                "stderr": stderr,
-                "command_id": command_id,
-            }
-        time.sleep(poll_interval_seconds)
-
-    return {
-        "status": "TimedOut",
-        "stdout": "",
-        "stderr": "",
-        "command_id": command_id,
-    }
-
-
-def _probe_remote_coremark_exists(
-    clients: Dict[str, object], *, instance_id: str
-) -> bool:
-    probe = _run_ssm_probe_command(
-        clients,
-        instance_id=instance_id,
-        commands=[
-            "set -euo pipefail",
-            'if [ -x "/tmp/coremark_streamlit/coremark" ]; then echo "__EXISTS__=1"; else echo "__EXISTS__=0"; fi',
-        ],
-        comment="Probe existing coremark binary",
-    )
-    return probe["status"] == "Success" and "__EXISTS__=1" in probe["stdout"]
-
-
-def _probe_remote_fio_exists(
-    clients: Dict[str, object], *, instance_id: str
-) -> bool:
-    probe = _run_ssm_probe_command(
-        clients,
-        instance_id=instance_id,
-        commands=[
-            "set -euo pipefail",
-            (
-                'if [ -x "/tmp/fio_streamlit/fio" ] '
-                '&& [ -f "/tmp/fio_streamlit/engines/fio-libaio.so" ] '
-                '&& [ -f "/tmp/fio_streamlit/lib/libaio.so.1" ] '
-                '&& [ -f "/tmp/fio_streamlit/lib/libnuma.so.1" ]; '
-                'then echo "__EXISTS__=1"; else echo "__EXISTS__=0"; fi'
-            ),
-        ],
-        comment="Probe existing fio runtime",
-    )
-    return probe["status"] == "Success" and "__EXISTS__=1" in probe["stdout"]
-
-
 def _render_connection_status() -> None:
     state_data = _load_session_from_state()
     if not state_data:
@@ -1382,7 +1144,7 @@ def _render_create_page(clients: Dict[str, object], region: str) -> None:
             iam_profile_name_to_use = ssm_setup_result["ProfileName"]
 
         with st.spinner("Creating EC2 instance..."):
-            created = create_instance(
+            created = create_ec2_instance(
                 ec2_client=ec2_client,
                 ami_id=ami_id,
                 instance_type=selected_instance_type,
@@ -1491,8 +1253,22 @@ def _run_coremark_test(
         f"parallel_coremark workers={cpu_threads}, per_worker='timeout {duration_seconds}s {remote_dir}/coremark 0x0 0x0 0x66 0'"
     )
     test_time = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    st.markdown("**Live output**")
+    status_placeholder = st.empty()
+    log_placeholder = st.empty()
+    live_output_lines: List[str] = []
+
+    def _on_live_update(status: str, lines: List[str]) -> None:
+        status_placeholder.write(f"Command status: `{status}` | Refresh every 2s")
+        log_placeholder.code("\n".join(lines[-4000:]), language="bash")
+
     try:
-        coremark_bundle = _resolve_coremark_bundle(instance)
+        arch = str(instance.get("Architecture") or "").strip().lower()
+        if not arch:
+            raise RuntimeError(
+                "Instance architecture is unavailable. Refresh instance detail and try again."
+            )
+        coremark_bundle = resolve_coremark_bundle_for_arch(arch)
     except RuntimeError as error:
         error_message = f"Failed to resolve local coremark bundle: {error}"
         st.error(error_message)
@@ -1520,12 +1296,20 @@ def _run_coremark_test(
 
     try:
         with _data_loading_scope():
-            command_id = start_coremark_benchmark(
+            run_result = run_coremark_once(
                 clients["ssm"],
                 instance_id=instance_id,
                 linux_binary_path=str(coremark_bundle["coremark_binary"]),
+                command_text=remote_command,
                 duration_seconds=duration_seconds,
                 cpu_threads=cpu_threads,
+                upload_binary=True,
+                max_polls=240,
+                poll_interval_seconds=2,
+                marker_prefixes_to_skip=["__COREMARK_RUNNING__"],
+                running_marker_prefix="__RUNNING__",
+                live_output_lines=live_output_lines,
+                on_update=_on_live_update,
             )
     except (ClientError, FileNotFoundError, RuntimeError) as error:
         message = f"Failed to start CoreMark test: {error}"
@@ -1552,21 +1336,12 @@ def _run_coremark_test(
         )
         return
 
+    command_id = run_result.command_id
     st.info(f"CoreMark command started: `{command_id}`")
-    poll_result = _poll_command_with_live_output(
-        clients,
-        instance_id=instance_id,
-        command_id=command_id,
-        command_text=remote_command,
-        marker_prefixes_to_skip=["__COREMARK_RUNNING__"],
-        max_polls=240,
-        poll_interval_seconds=2,
-    )
-    status = str(poll_result["status"])
-    poll_error = poll_result.get("poll_error")
-    combined_output = str(poll_result.get("combined_output", "") or "")
-
-    parsed = parse_coremark_result(combined_output)
+    status = str(run_result.status)
+    poll_error = run_result.poll_error
+    combined_output = str(run_result.output or "")
+    parsed = run_result.parsed
     exit_code = parsed.get("exit_code")
     score = parsed.get("coremark_score")
     iterations_per_sec = parsed.get("iterations_per_sec")
@@ -1716,7 +1491,12 @@ def _run_fio_test(
 ) -> None:
     instance_id = str(instance["InstanceId"])
     try:
-        fio_bundle = _resolve_fio_bundle(instance)
+        arch = str(instance.get("Architecture") or "").strip().lower()
+        if not arch:
+            raise RuntimeError(
+                "Instance architecture is unavailable. Refresh instance detail and try again."
+            )
+        fio_bundle = resolve_fio_bundle_for_arch(arch)
     except RuntimeError as error:
         message = f"Failed to resolve local fio bundle: {error}"
         st.error(message)
@@ -1744,20 +1524,33 @@ def _run_fio_test(
     cleanup_glob = f"/mnt/fio/{test_type}*"
     displayed_command = f"{fio_command} ; rm -f {cleanup_glob}"
     test_time = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    st.markdown("**Live output**")
+    status_placeholder = st.empty()
+    log_placeholder = st.empty()
+    live_output_lines: List[str] = []
+
+    def _on_live_update(status: str, lines: List[str]) -> None:
+        status_placeholder.write(f"Command status: `{status}` | Refresh every 2s")
+        log_placeholder.code("\n".join(lines[-4000:]), language="bash")
 
     try:
         with _data_loading_scope():
-            command_id = start_fio_benchmark(
+            run_result = run_fio_once(
                 clients["ssm"],
                 instance_id=instance_id,
+                test_name=test_type,
                 fio_command=fio_command,
+                cleanup_glob=cleanup_glob,
                 linux_fio_binary_path=str(fio_bundle["fio_binary"]),
                 linux_fio_engine_libaio_path=str(fio_bundle["fio_engine"]),
                 linux_shared_lib_paths=[str(path) for path in fio_bundle["shared_libs"]],
-                test_name=test_type,
-                cleanup_glob=cleanup_glob,
+                command_text=displayed_command,
                 upload_bundle=True,
                 timeout_seconds=900,
+                max_polls=360,
+                poll_interval_seconds=2,
+                live_output_lines=live_output_lines,
+                on_update=_on_live_update,
             )
     except (ClientError, RuntimeError) as error:
         message = f"Failed to start {display_name} test: {error}"
@@ -1783,21 +1576,12 @@ def _run_fio_test(
         )
         return
 
+    command_id = run_result.command_id
     st.info(f"{display_name} command started: `{command_id}`")
-    poll_result = _poll_command_with_live_output(
-        clients,
-        instance_id=instance_id,
-        command_id=command_id,
-        command_text=displayed_command,
-        marker_prefixes_to_skip=None,
-        max_polls=360,
-        poll_interval_seconds=2,
-    )
-    status = str(poll_result["status"])
-    poll_error = poll_result.get("poll_error")
-    combined_output = str(poll_result.get("combined_output", "") or "")
-
-    parsed = parse_fio_result(combined_output)
+    status = str(run_result.status)
+    poll_error = run_result.poll_error
+    combined_output = str(run_result.output or "")
+    parsed = run_result.parsed
     bw_mib_s = parsed.get("bw_mib_s")
     iops = parsed.get("iops")
     exit_code = parsed.get("exit_code")
@@ -2000,7 +1784,12 @@ def _run_cpu_io_test_suite(
     coremark_bundle: Optional[Dict[str, object]] = None
     coremark_bundle_error: Optional[str] = None
     try:
-        fio_bundle = _resolve_fio_bundle(instance)
+        arch = str(instance.get("Architecture") or "").strip().lower()
+        if not arch:
+            raise RuntimeError(
+                "Instance architecture is unavailable. Refresh instance detail and try again."
+            )
+        fio_bundle = resolve_fio_bundle_for_arch(arch)
         _append_live_output_block(
             live_output_lines,
             log_placeholder,
@@ -2017,7 +1806,12 @@ def _run_cpu_io_test_suite(
             f"# FIO bundle resolve failed: {fio_bundle_error}",
         )
     try:
-        coremark_bundle = _resolve_coremark_bundle(instance)
+        arch = str(instance.get("Architecture") or "").strip().lower()
+        if not arch:
+            raise RuntimeError(
+                "Instance architecture is unavailable. Refresh instance detail and try again."
+            )
+        coremark_bundle = resolve_coremark_bundle_for_arch(arch)
         _append_live_output_block(
             live_output_lines,
             log_placeholder,
@@ -2053,8 +1847,8 @@ def _run_cpu_io_test_suite(
     if not fio_bundle_error:
         try:
             with _data_loading_scope():
-                remote_fio_ready = _probe_remote_fio_exists(
-                    clients,
+                remote_fio_ready = probe_remote_fio_exists(
+                    clients["ssm"],
                     instance_id=instance_id,
                 )
             if remote_fio_ready:
@@ -2080,8 +1874,8 @@ def _run_cpu_io_test_suite(
     coremark_upload_needed = True
     try:
         with _data_loading_scope():
-            remote_coremark_ready = _probe_remote_coremark_exists(
-                clients,
+            remote_coremark_ready = probe_remote_coremark_exists(
+                clients["ssm"],
                 instance_id=instance_id,
             )
         if remote_coremark_ready:
@@ -2143,19 +1937,29 @@ def _run_cpu_io_test_suite(
             }
         )
     else:
-        cpu_command_id: Optional[str] = None
         try:
             with _data_loading_scope():
-                cpu_command_id = start_coremark_benchmark(
+                cpu_run_result = run_coremark_once(
                     clients["ssm"],
                     instance_id=instance_id,
                     linux_binary_path=str(coremark_bundle["coremark_binary"]),
+                    command_text=cpu_command,
                     duration_seconds=cpu_duration_seconds,
                     cpu_threads=configured_cpu_threads,
                     upload_binary=coremark_upload_needed,
                     cgroup_cpu_cores=cgroup_cpu_cores,
                     cgroup_memory_mib=cgroup_memory_mib,
-                    cgroup_name_prefix="benchmark-cpu",
+                    marker_prefixes_to_skip=["__COREMARK_RUNNING__"],
+                    max_polls=240,
+                    poll_interval_seconds=2,
+                    running_marker_prefix="__CPU_RUNNING__",
+                    live_output_lines=live_output_lines,
+                    on_update=lambda status, lines: (
+                        status_placeholder.write(
+                            f"Command status: `{status}` | Refresh every 2s"
+                        ),
+                        log_placeholder.code("\n".join(lines[-4000:]), language="bash"),
+                    ),
                 )
         except (ClientError, FileNotFoundError, RuntimeError) as error:
             message = f"Failed to start CPU test: {error}"
@@ -2171,40 +1975,27 @@ def _run_cpu_io_test_suite(
                     "command_id": None,
                     "test_type": TEST_TYPE_CPU,
                     "metric_value": None,
-                        "metric_unit": "coremark",
-                        "coremark_score": None,
-                        "iterations_per_sec": None,
-                        "cpu_test_threads": configured_cpu_threads,
-                        "result_summary": "Failed to start CPU test",
-                        "raw_output": "",
-                        "error_message": message,
+                    "metric_unit": "coremark",
+                    "coremark_score": None,
+                    "iterations_per_sec": None,
+                    "cpu_test_threads": configured_cpu_threads,
+                    "result_summary": "Failed to start CPU test",
+                    "raw_output": "",
+                    "error_message": message,
                 }
             )
         else:
+            cpu_command_id = cpu_run_result.command_id
             _append_live_output_block(
                 live_output_lines,
                 log_placeholder,
                 f"[CPU] command started: {cpu_command_id}",
             )
             _set_command_id("CPU", cpu_command_id)
-            cpu_poll_result = _poll_command_with_live_output(
-                clients,
-                instance_id=instance_id,
-                command_id=cpu_command_id,
-                command_text=cpu_command,
-                marker_prefixes_to_skip=["__COREMARK_RUNNING__"],
-                max_polls=240,
-                poll_interval_seconds=2,
-                show_live_heading=False,
-                log_placeholder=log_placeholder,
-                status_placeholder=status_placeholder,
-                live_output_lines=live_output_lines,
-                running_marker_prefix="__CPU_RUNNING__",
-            )
-            cpu_status = str(cpu_poll_result["status"])
-            cpu_poll_error = cpu_poll_result.get("poll_error")
-            cpu_output = str(cpu_poll_result.get("combined_output", "") or "")
-            cpu_parsed = parse_coremark_result(cpu_output)
+            cpu_status = str(cpu_run_result.status)
+            cpu_poll_error = cpu_run_result.poll_error
+            cpu_output = str(cpu_run_result.output or "")
+            cpu_parsed = cpu_run_result.parsed
             cpu_score = cpu_parsed.get("coremark_score")
             cpu_iterations_per_sec = cpu_parsed.get("iterations_per_sec")
             cpu_exit_code = cpu_parsed.get("exit_code")
@@ -2365,18 +2156,27 @@ def _run_cpu_io_test_suite(
 
         prep_time = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
         prep_command = "mkdir -p /mnt/fio"
-        prep_command_id: Optional[str] = None
         try:
             with _data_loading_scope():
-                prep_response = clients["ssm"].send_command(
-                    InstanceIds=[instance_id],
-                    DocumentName="AWS-RunShellScript",
-                    Parameters={"commands": ["set -euo pipefail", prep_command]},
-                    TimeoutSeconds=120,
-                    Comment=f"Prepare fio dir for {test_type}",
+                prep_run_result = run_shell_command_once(
+                    clients["ssm"],
+                    instance_id=instance_id,
+                    commands=["set -euo pipefail", prep_command],
+                    command_text=prep_command,
+                    comment=f"Prepare fio dir for {test_type}",
+                    timeout_seconds=120,
+                    max_polls=60,
+                    poll_interval_seconds=2,
+                    running_marker_prefix=f"__{display_name.upper()}_PREP__",
+                    live_output_lines=live_output_lines,
+                    on_update=lambda status, lines: (
+                        status_placeholder.write(
+                            f"Command status: `{status}` | Refresh every 2s"
+                        ),
+                        log_placeholder.code("\n".join(lines[-4000:]), language="bash"),
+                    ),
                 )
-                prep_command_id = prep_response["Command"]["CommandId"]
-        except ClientError as error:
+        except (ClientError, RuntimeError) as error:
             summary = f"{display_name} prepare /mnt/fio failed: {error}"
             _record_summary(display_name, summary, success=False)
             _insert_suite_step_result(
@@ -2400,28 +2200,16 @@ def _run_cpu_io_test_suite(
             )
             return
 
+        prep_command_id = prep_run_result.command_id
         _append_live_output_block(
             live_output_lines,
             log_placeholder,
             f"[{display_name}] prepare dir command started: {prep_command_id}",
         )
         _set_command_id(display_name, prep_command_id)
-        prep_poll = _poll_command_with_live_output(
-            clients,
-            instance_id=instance_id,
-            command_id=str(prep_command_id),
-            command_text=prep_command,
-            max_polls=60,
-            poll_interval_seconds=2,
-            show_live_heading=False,
-            log_placeholder=log_placeholder,
-            status_placeholder=status_placeholder,
-            live_output_lines=live_output_lines,
-            running_marker_prefix=f"__{display_name.upper()}_PREP__",
-        )
-        prep_status = str(prep_poll["status"])
-        prep_error = prep_poll.get("poll_error")
-        prep_output = str(prep_poll.get("combined_output", "") or "")
+        prep_status = str(prep_run_result.status)
+        prep_error = prep_run_result.poll_error
+        prep_output = str(prep_run_result.output or "")
         if prep_error or prep_status != "Success":
             summary = (
                 f"{display_name} prepare /mnt/fio failed: {prep_error}"
@@ -2453,24 +2241,33 @@ def _run_cpu_io_test_suite(
         fio_test_time = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
         cleanup_glob = f"/mnt/fio/{test_type}*"
         displayed_command = f"{fio_command} ; rm -f {cleanup_glob}"
-        fio_command_id: Optional[str] = None
         try:
             with _data_loading_scope():
-                fio_command_id = start_fio_benchmark(
+                fio_run_result = run_fio_once(
                     clients["ssm"],
                     instance_id=instance_id,
+                    test_name=test_type,
                     fio_command=fio_command,
+                    cleanup_glob=cleanup_glob,
                     linux_fio_binary_path=str(fio_bundle["fio_binary"]),
                     linux_fio_engine_libaio_path=str(fio_bundle["fio_engine"]),
                     linux_shared_lib_paths=[str(path) for path in fio_bundle["shared_libs"]],
-                    test_name=test_type,
-                    cleanup_glob=cleanup_glob,
+                    command_text=displayed_command,
                     upload_bundle=not fio_bundle_uploaded,
                     upload_timeout_seconds=1200,
                     timeout_seconds=900,
                     cgroup_cpu_cores=cgroup_cpu_cores,
                     cgroup_memory_mib=cgroup_memory_mib,
-                    cgroup_name_prefix=f"benchmark-{test_type}",
+                    max_polls=360,
+                    poll_interval_seconds=2,
+                    running_marker_prefix=f"__{display_name.upper()}_RUNNING__",
+                    live_output_lines=live_output_lines,
+                    on_update=lambda status, lines: (
+                        status_placeholder.write(
+                            f"Command status: `{status}` | Refresh every 2s"
+                        ),
+                        log_placeholder.code("\n".join(lines[-4000:]), language="bash"),
+                    ),
                 )
                 fio_bundle_uploaded = True
         except (ClientError, RuntimeError) as error:
@@ -2497,29 +2294,17 @@ def _run_cpu_io_test_suite(
             )
             return
 
+        fio_command_id = fio_run_result.command_id
         _append_live_output_block(
             live_output_lines,
             log_placeholder,
             f"[{display_name}] command started: {fio_command_id}",
         )
         _set_command_id(display_name, fio_command_id)
-        fio_poll = _poll_command_with_live_output(
-            clients,
-            instance_id=instance_id,
-            command_id=str(fio_command_id),
-            command_text=displayed_command,
-            max_polls=360,
-            poll_interval_seconds=2,
-            show_live_heading=False,
-            log_placeholder=log_placeholder,
-            status_placeholder=status_placeholder,
-            live_output_lines=live_output_lines,
-            running_marker_prefix=f"__{display_name.upper()}_RUNNING__",
-        )
-        fio_status = str(fio_poll["status"])
-        fio_poll_error = fio_poll.get("poll_error")
-        fio_output = str(fio_poll.get("combined_output", "") or "")
-        fio_parsed = parse_fio_result(fio_output)
+        fio_status = str(fio_run_result.status)
+        fio_poll_error = fio_run_result.poll_error
+        fio_output = str(fio_run_result.output or "")
+        fio_parsed = fio_run_result.parsed
         fio_bw_mib_s = fio_parsed.get("bw_mib_s")
         fio_iops = fio_parsed.get("iops")
         fio_avg_latency_ms = fio_parsed.get("avg_latency_ms")
@@ -2835,7 +2620,7 @@ def _render_detail_page(clients: Dict[str, object], region: str, instance_id: st
             return
         try:
             with _data_loading_scope():
-                result = terminate_instances(clients["ec2"], [instance["InstanceId"]])
+                result = terminate_ec2_instances(clients["ec2"], [instance["InstanceId"]])
                 _refresh_instance_cache(clients["ec2"], include_terminated=False)
             st.success("Terminate request submitted.")
             st.json(result)
